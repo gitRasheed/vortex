@@ -2,8 +2,8 @@
 // @generated
 extern crate alloc;
 
-use crate::array::*;
-use crate::layout::*;
+use crate::flatbuffers::deps::array::*;
+use crate::flatbuffers::deps::layout::*;
 
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MIN_COMPRESSION_SCHEME: u8 = 0;

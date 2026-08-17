@@ -30,6 +30,12 @@ documentation in `docs/`, and benchmark tooling in `vortex-bench/` and `benchmar
   and the OpenDAL-backed services (`cos://`, `oss://`). Every binding resolves URLs through it.
 - `vortex-scan`, `vortex-session`, `vortex-datafusion`, and `vortex-duckdb` contain scan
   and execution integrations.
+- FlatBuffers (`.fbs`) and Protocol Buffers (`.proto`) schemas live in the crate that owns the
+  types they describe (`vortex-array`, `vortex-layout`, `vortex-file`, `vortex-ipc`), alongside
+  their checked-in bindings in `src/generated`. Regenerate with `cargo xtask generate-fbs` and
+  `cargo xtask generate-proto` after editing a schema; `xtask/src/schemas.rs` declares which crates'
+  schemas each one includes from. `generate-fbs` needs `flatc`; ordinary builds need neither `flatc`
+  nor `protoc`.
 - `vortex-python` contains Python bindings. RST-flavored project docs live in `docs/`.
 
 ## Scoped Guidance

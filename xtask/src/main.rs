@@ -3,6 +3,7 @@
 
 mod generate_fbs;
 mod generate_proto;
+mod schemas;
 
 use clap::Parser;
 

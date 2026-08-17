@@ -36,6 +36,22 @@ The contribution process is outlined below:
 
 ## Development Workflows
 
+### Generated FlatBuffers and Protocol Buffers bindings
+
+Bindings for the `.fbs` and `.proto` schemas are checked in under `src/generated` in the crate that
+owns each schema, so an ordinary build needs no code generation tooling. After changing a schema,
+regenerate them and commit the result:
+
+```bash
+cargo xtask generate-fbs
+cargo xtask generate-proto
+```
+
+`generate-fbs` needs the [`flatc`](https://github.com/google/flatbuffers/releases) compiler on
+`PATH`, or its location in the `FLATC` environment variable; CI pins version `25.12.19`.
+`generate-proto` parses schemas in pure Rust, so it needs no `protoc` install. CI regenerates both
+and fails if the checked-in output differs.
+
 The repository uses [`uv`](https://docs.astral.sh/uv/) to manage its Python workspace. From the
 repository root, create or update the development environment with:
 
