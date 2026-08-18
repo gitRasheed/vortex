@@ -76,6 +76,30 @@ typedef struct {
     bool has_null;
 } duckdb_column_statistics;
 
+// File-level statistics of a written Vortex file, for the DuckLake
+// WRITTEN_FILE_STATISTICS return path. Filled by Rust from the WriteSummary.
+typedef struct {
+    uint64_t row_count;
+    uint64_t file_size_bytes;
+    uint64_t footer_size_bytes;
+    uint64_t num_columns;
+} duckdb_vx_written_file_statistics;
+
+// Per-column statistics of a written Vortex file. `min`/`max` are owned
+// duckdb_value handles (null if absent) that the caller must destroy.
+typedef struct {
+    duckdb_value min;
+    duckdb_value max;
+    bool has_null_count;
+    uint64_t null_count;
+    uint64_t num_values;
+    bool has_column_size;
+    uint64_t column_size_bytes;
+    // Whether a NaN-count statistic was available (float columns), and whether it saw any NaN.
+    bool has_nan_stat;
+    bool contains_nan;
+} duckdb_vx_written_column_statistics;
+
 const idx_t INVALID_IDX = UINT64_MAX;
 
 typedef struct {
