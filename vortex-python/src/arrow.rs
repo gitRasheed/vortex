@@ -334,7 +334,23 @@ impl IntoPyArrow for Box<dyn RecordBatchReader + Send> {
     // We can't implement `ToPyArrow` for `T: RecordBatchReader + Send` because
     // there is already a blanket implementation for `T: ToPyArrow`.
     fn into_pyarrow(self, py: Python) -> PyResult<Py<PyAny>> {
-        let mut stream = FFI_ArrowArrayStream::new(self);
+        let schema = self.schema();
+        let mut reader = self;
+        let reader = RecordBatchIterator::new(
+            std::iter::from_fn(move || {
+                let batch = reader.next();
+                Python::attach(|py| match py.check_signals() {
+                    Ok(()) => batch,
+                    Err(err) => {
+                        // End the C stream with the PyErr restored so PyArrow can propagate it.
+                        err.restore(py);
+                        None
+                    }
+                })
+            }),
+            schema,
+        );
+        let mut stream = FFI_ArrowArrayStream::new(Box::new(reader));
 
         let args = PyTuple::new(py, [&raw mut stream as Py_uintptr_t])?;
         let reader =

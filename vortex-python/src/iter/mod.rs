@@ -21,9 +21,9 @@ use pyo3::types::PyIterator;
 use vortex::array::Canonical;
 use vortex::array::IntoArray;
 use vortex::array::VortexSessionExecute;
+use vortex::array::arrays::ChunkedArray;
 use vortex::array::iter::ArrayIterator;
 use vortex::array::iter::ArrayIteratorAdapter;
-use vortex::array::iter::ArrayIteratorExt;
 use vortex::dtype::DType;
 use vortex_arrow::ArrowSessionExt;
 
@@ -99,12 +99,26 @@ impl PyArrayIterator {
     /// Read all chunks into a single :class:`vortex.Array`. If there are multiple chunks,
     /// this will be a :class:`vortex.ChunkedArray`, otherwise it will be a single array.
     fn read_all(&self, py: Python) -> PyVortexResult<PyArrayRef> {
-        let array = py.detach(|| {
-            if let Some(iter) = self.iter.lock().take() {
-                iter.read_all()
+        let array = py.detach(|| -> PyVortexResult<_> {
+            let Some(mut iter) = self.iter.lock().take() else {
+                return Ok(Canonical::empty(&self.dtype).into_array());
+            };
+
+            let mut chunks = Vec::new();
+            loop {
+                let chunk = iter.next().transpose()?;
+                Python::attach(|py| py.check_signals())?;
+
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                chunks.push(chunk);
+            }
+
+            if chunks.len() == 1 {
+                Ok(chunks.remove(0))
             } else {
-                // Otherwise, we continue to return an empty array.
-                Ok(Canonical::empty(&self.dtype).into_array())
+                Ok(ChunkedArray::try_new(chunks, self.dtype.clone())?.into_array())
             }
         })?;
         Ok(PyArrayRef::from(array))

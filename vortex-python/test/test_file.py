@@ -3,6 +3,10 @@
 
 import math
 import os
+import signal
+import subprocess
+import sys
+from pathlib import Path
 
 import pyarrow as pa
 import pytest
@@ -43,6 +47,24 @@ def test_row_count(vxf: VortexFile):
 def test_scan(vxf: VortexFile):
     for _ in vxf.scan():
         pass
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX signals")
+@pytest.mark.parametrize("method", ["scan", "to_arrow"])
+def test_scan_read_all_handles_sigint(tmp_path: Path, method: str):
+    path = tmp_path / "signal.vortex"
+    values = pa.array(range(250_000))
+    vx.io.write(vx.array(pa.table({"value": values})), str(path))
+    script = (
+        "import os, signal, threading\n"
+        "import vortex as vx\n"
+        f"reader = vx.open({str(path)!r}).{method}(batch_size=1)\n"
+        "threading.Timer(0.1, lambda: os.kill(os.getpid(), signal.SIGINT)).start()\n"
+        "reader.read_all()\n"
+    )
+
+    result = subprocess.run([sys.executable, "-c", script], stderr=subprocess.PIPE, timeout=5)
+    assert result.returncode == -signal.SIGINT
 
 
 def test_scan_with_indices(vxf: VortexFile):
