@@ -70,6 +70,9 @@ use crate::table_function::convert_result;
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 
+/// Number of adjacent Vortex splits assigned to one DuckDB scan unit.
+const SPLITS_PER_SCAN_UNIT: usize = 2;
+
 fn resolve_filesystem(url: &Url) -> VortexResult<(FileSystemRef, String)> {
     // Compat makes us use tokio which is very bad for local reads on
     // high-core machines because reads go into blocking pool
@@ -191,10 +194,13 @@ pub fn reader_initialize(file: &mut OpenFileReader, global: &GlobalState) -> Vor
 /// duckdb thinks file is exhausted, closes the file, and the first thread to
 /// get "false" switches to next file.
 pub fn reader_try_initialize_scan(file: &mut OpenFileReader, local: &mut LocalState) -> bool {
-    let Some(split) = file.splits.pop() else {
+    if file.splits.is_empty() {
         return false;
-    };
-    local.split = Some(split);
+    }
+
+    debug_assert!(local.splits.is_empty());
+    let unit_start = file.splits.len().saturating_sub(SPLITS_PER_SCAN_UNIT);
+    local.splits = file.splits.split_off(unit_start);
     true
 }
 
@@ -211,17 +217,15 @@ pub fn reader_scan(
         return reader_scan_aggregate(global, local);
     }
 
-    if local.exporter.is_none() {
-        let Some(split) = local.split.take() else {
+    while local.exporter.is_none() {
+        let Some(split) = local.splits.pop() else {
             return Ok(false);
         };
-        let Some(array) = RUNTIME.block_on(split)? else {
-            // split is filtered
-            return Ok(true);
-        };
-        let mut ctx = SESSION.create_execution_ctx();
-        let array = convert_result(array, &mut ctx)?;
-        local.exporter = Some(ArrayExporter::try_new(&array, &file.cache, ctx)?);
+        if let Some(array) = RUNTIME.block_on(split)? {
+            let mut ctx = SESSION.create_execution_ctx();
+            let array = convert_result(array, &mut ctx)?;
+            local.exporter = Some(ArrayExporter::try_new(&array, &file.cache, ctx)?);
+        }
     }
     let exporter = local.exporter.as_mut().vortex_expect("no exporter");
 
@@ -233,7 +237,7 @@ pub fn reader_scan(
 }
 
 fn reader_scan_aggregate(global: &GlobalState, local: &mut LocalState) -> VortexResult<bool> {
-    let Some(split) = local.split.take() else {
+    let Some(split) = local.splits.pop() else {
         return Ok(false);
     };
     let Some(array) = RUNTIME.block_on(split)? else {

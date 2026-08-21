@@ -166,7 +166,7 @@ pub type Partials = Vec<(usize, Box<dyn DynAccumulator>)>;
 /// Per-thread scan state
 pub struct LocalState {
     pub exporter: Option<ArrayExporter>,
-    pub split: Option<Split>,
+    pub splits: Vec<Split>,
 
     /// Empty for non-aggregate scan
     pub partials: Partials,
@@ -365,7 +365,7 @@ pub fn init_local(bind_data: &BindState, global: &GlobalState) -> LocalState {
     LocalState {
         exporter: None,
         partials,
-        split: None,
+        splits: Vec::new(),
         finished: false,
     }
 }
