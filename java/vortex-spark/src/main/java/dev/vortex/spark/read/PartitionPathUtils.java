@@ -7,6 +7,7 @@ import com.google.common.base.Splitter;
 import com.google.common.primitives.Doubles;
 import com.google.common.primitives.Ints;
 import com.google.common.primitives.Longs;
+import java.math.BigDecimal;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
@@ -17,6 +18,8 @@ import org.apache.spark.sql.types.ByteType;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.DateType;
+import org.apache.spark.sql.types.Decimal;
+import org.apache.spark.sql.types.DecimalType;
 import org.apache.spark.sql.types.DoubleType;
 import org.apache.spark.sql.types.FloatType;
 import org.apache.spark.sql.types.IntegerType;
@@ -102,6 +105,11 @@ public final class PartitionPathUtils {
             vec.setFloat(Float.parseFloat(value));
         } else if (type instanceof DoubleType) {
             vec.setDouble(Double.parseDouble(value));
+        } else if (type instanceof DecimalType) {
+            DecimalType decimalType = (DecimalType) type;
+            vec.setDecimal(
+                    Decimal.apply(new BigDecimal(value), decimalType.precision(), decimalType.scale()),
+                    decimalType.precision());
         } else {
             vec.setUtf8String(UTF8String.fromString(value));
         }
