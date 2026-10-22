@@ -5,6 +5,7 @@ package dev.vortex.spark;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
 import java.math.BigDecimal;
@@ -502,6 +503,54 @@ public final class VortexFilterPushdownTest {
         assertEquals(
                 List.of(2, 6),
                 idsOf(readDf.filter(readDf.col("label").contains("no-")).orderBy("id")));
+    }
+
+    @Test
+    @DisplayName("Predicates on collated string columns are left to Spark")
+    public void testCollatedStringPredicatesStayWithSpark() throws IOException {
+        assumeTrue(spark.version().startsWith("4."), "string collations require Spark 4");
+        Dataset<Row> df = spark.createDataFrame(
+                Arrays.asList(
+                        RowFactory.create(1, "abc"),
+                        RowFactory.create(2, "ABC"),
+                        RowFactory.create(3, "AbC"),
+                        RowFactory.create(4, "abd"),
+                        RowFactory.create(5, null)),
+                DataTypes.createStructType(Arrays.asList(
+                        DataTypes.createStructField("id", DataTypes.IntegerType, false),
+                        DataTypes.createStructField("s", DataTypes.StringType, true))));
+
+        Path outputPath = tempDir.resolve("pushdown_collated");
+        df.write()
+                .format("vortex")
+                .option("path", outputPath.toUri().toString())
+                .mode(SaveMode.Overwrite)
+                .save();
+
+        // Vortex compares bytes, so a pushed predicate would ignore the case-insensitive collation.
+        Dataset<Row> readDf = spark.read()
+                .format("vortex")
+                .schema("id int, s string collate utf8_lcase")
+                .option("path", outputPath.toUri().toString())
+                .load();
+
+        assertEquals(List.of(1, 2, 3), idsOf(readDf.filter("s = 'ABC'").orderBy("id")));
+        assertEquals(List.of(1, 2, 3), idsOf(readDf.filter("s IN ('abc')").orderBy("id")));
+        // Bytewise 'a' sorts after 'B', case-insensitively it sorts before.
+        assertEquals(List.of(1, 2, 3, 4), idsOf(readDf.filter("s < 'B'").orderBy("id")));
+        assertEquals(
+                List.of(1, 2, 3),
+                idsOf(readDf.filter(readDf.col("s").startsWith("ABC")).orderBy("id")));
+        // Spark 4.1 cannot even render a pushed CONTAINS on a collated literal (V2ExpressionSQLBuilder).
+        assertEquals(
+                List.of(1, 2, 3, 4),
+                idsOf(readDf.filter(readDf.col("s").contains("b")).orderBy("id")));
+
+        // Null checks do not depend on the collation and still push down.
+        Dataset<Row> notNull = readDf.filter("s IS NOT NULL");
+        assertEquals(List.of(1, 2, 3, 4), idsOf(notNull.orderBy("id")));
+        String plan = notNull.queryExecution().executedPlan().toString();
+        assertTrue(plan.contains("pushedPredicates=[s IS NOT NULL]"), "Expected pushed IS NOT NULL in: " + plan);
     }
 
     @Test

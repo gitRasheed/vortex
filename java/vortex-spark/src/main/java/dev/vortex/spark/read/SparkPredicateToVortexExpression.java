@@ -25,6 +25,7 @@ import org.apache.spark.sql.types.BinaryType;
 import org.apache.spark.sql.types.BooleanType;
 import org.apache.spark.sql.types.ByteType;
 import org.apache.spark.sql.types.DataType;
+import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.DateType;
 import org.apache.spark.sql.types.Decimal;
 import org.apache.spark.sql.types.DecimalType;
@@ -126,7 +127,7 @@ final class SparkPredicateToVortexExpression {
             case "=", "<>", "!=", ">", ">=", "<", "<=" -> isPushableComparison(children, dataColumnTypes);
             case "IS_NULL", "IS_NOT_NULL" -> children.length == 1 && isPushableFieldRef(children[0]);
             case "IN" -> {
-                if (children.length < 2 || !isPushableFieldRef(children[0])) {
+                if (children.length < 2 || !isComparableFieldRef(children[0], dataColumnTypes)) {
                     yield false;
                 }
                 for (int i = 1; i < children.length; i++) {
@@ -137,7 +138,9 @@ final class SparkPredicateToVortexExpression {
                 yield true;
             }
             case "STARTS_WITH", "ENDS_WITH", "CONTAINS" ->
-                children.length == 2 && isPushableFieldRef(children[0]) && isPushableStringLiteral(children[1]);
+                children.length == 2
+                        && isComparableFieldRef(children[0], dataColumnTypes)
+                        && isPushableStringLiteral(children[1]);
             // `BOOLEAN_EXPRESSION` wraps a bare boolean-valued child. We only handle the case
             // where the child itself is a field reference (e.g. `WHERE bool_col`).
             case "BOOLEAN_EXPRESSION" -> children.length == 1 && isPushableFieldRef(children[0]);
@@ -360,8 +363,8 @@ final class SparkPredicateToVortexExpression {
         if (children.length != 2) {
             return false;
         }
-        boolean lhsCol = isPushableFieldRef(children[0]);
-        boolean rhsCol = isPushableFieldRef(children[1]);
+        boolean lhsCol = isComparableFieldRef(children[0], dataColumnTypes);
+        boolean rhsCol = isComparableFieldRef(children[1], dataColumnTypes);
         if (lhsCol && rhsCol) {
             // Spark treats -0.0 and 0.0 as equal while Vortex orders them. `compareToLiteral` rewrites
             // comparisons against a zero literal; comparing two float columns is left to Spark.
@@ -375,6 +378,25 @@ final class SparkPredicateToVortexExpression {
 
     private static boolean isPushableFieldRef(org.apache.spark.sql.connector.expressions.Expression expr) {
         return expr instanceof NamedReference && ((NamedReference) expr).fieldNames().length >= 1;
+    }
+
+    /**
+     * A field reference whose values Vortex compares the way Spark does. Spark 4 strings carry a collation, and Vortex
+     * compares bytes, which only matches the default {@code UTF8_BINARY} collation; predicates on strings with any
+     * other collation are left to Spark, as Spark does for its own file sources (see
+     * {@code DataSourceStrategy.collationAwareFilter}). Null checks do not compare values and are unaffected.
+     */
+    private static boolean isComparableFieldRef(
+            org.apache.spark.sql.connector.expressions.Expression expr, Map<String, DataType> dataColumnTypes) {
+        return isPushableFieldRef(expr)
+                && resolveFieldType(((NamedReference) expr).fieldNames(), dataColumnTypes)
+                        .map(dataType -> !isCollatedString(dataType))
+                        .orElse(false);
+    }
+
+    /** True for a string type other than Spark's default, whose comparisons are bytewise like Vortex's. */
+    private static boolean isCollatedString(DataType dataType) {
+        return dataType instanceof StringType && !dataType.equals(DataTypes.StringType);
     }
 
     private static boolean isFloatingPointColumn(
@@ -401,10 +423,10 @@ final class SparkPredicateToVortexExpression {
     }
 
     private static Optional<String> stringValueOf(org.apache.spark.sql.connector.expressions.Expression expr) {
-        if (!(expr instanceof Literal<?>)) {
+        if (!(expr instanceof Literal<?> lit) || isCollatedString(lit.dataType())) {
             return Optional.empty();
         }
-        Object value = ((Literal<?>) expr).value();
+        Object value = lit.value();
         if (value == null) {
             return Optional.empty();
         }
@@ -436,7 +458,7 @@ final class SparkPredicateToVortexExpression {
                     || dataType instanceof LongType
                     || dataType instanceof FloatType
                     || dataType instanceof DoubleType
-                    || dataType instanceof StringType
+                    || (dataType instanceof StringType && !isCollatedString(dataType))
                     || dataType instanceof BinaryType
                     || dataType instanceof DateType
                     || dataType instanceof TimestampType
@@ -499,7 +521,7 @@ final class SparkPredicateToVortexExpression {
             }
             return Optional.of(Expression.literal(((Number) value).doubleValue()));
         }
-        if (dataType instanceof StringType) {
+        if (dataType instanceof StringType && !isCollatedString(dataType)) {
             if (value == null) {
                 return Optional.of(Expression.nullLiteral(Expression.DType.UTF8));
             }
