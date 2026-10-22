@@ -137,6 +137,22 @@ final class SparkPredicateToVortexExpressionTest {
     }
 
     @Test
+    @DisplayName("Float columns compare against literals, including both zeros, but not against other columns")
+    void floatingPointComparisons() {
+        // Vortex orders -0.0 below 0.0 while Spark treats them as equal: `compareToLiteral` rewrites
+        // comparisons against a zero literal, and column-to-column float comparisons stay with Spark.
+        assertPushableAndConvertible(equality(ref("ratio"), new LiteralValue<>(-0.0f, DataTypes.FloatType)));
+        assertPushableAndConvertible(predicate("<", new LiteralValue<>(0.0d, DataTypes.DoubleType), ref("weight")));
+        assertPushableAndConvertible(predicate(
+                "IN",
+                ref("weight"),
+                new LiteralValue<>(0.0d, DataTypes.DoubleType),
+                new LiteralValue<>(1.5d, DataTypes.DoubleType)));
+        assertFalse(SparkPredicateToVortexExpression.isPushable(equality(ref("ratio"), ref("weight")), SCHEMA));
+        assertFalse(SparkPredicateToVortexExpression.isPushable(predicate(">", ref("id"), ref("weight")), SCHEMA));
+    }
+
+    @Test
     @DisplayName("Comparison between two literals is rejected by both sides")
     void literalToLiteralComparisonIsRejected() {
         assertNotPushableAndNotConvertible(equality(literal(1), literal(2)));

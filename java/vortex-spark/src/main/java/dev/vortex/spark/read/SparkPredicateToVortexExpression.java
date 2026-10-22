@@ -75,36 +75,37 @@ final class SparkPredicateToVortexExpression {
      */
     static boolean isPushable(Predicate predicate, Map<String, DataType> dataColumnTypes) {
         for (NamedReference ref : predicate.references()) {
-            if (!resolveFieldPath(ref.fieldNames(), dataColumnTypes)) {
+            if (resolveFieldType(ref.fieldNames(), dataColumnTypes).isEmpty()) {
                 return false;
             }
         }
-        return isStructurallyPushable(predicate);
+        return isStructurallyPushable(predicate, dataColumnTypes);
     }
 
     /**
      * Walks {@code parts} against {@code dataColumnTypes}, descending through {@link StructType} fields for
-     * dot-separated nested references. Returns true only when every part resolves to an actual field in the schema.
+     * dot-separated nested references. Returns the referenced field's type, or empty unless every part resolves to an
+     * actual field in the schema.
      */
-    private static boolean resolveFieldPath(String[] parts, Map<String, DataType> dataColumnTypes) {
+    private static Optional<DataType> resolveFieldType(String[] parts, Map<String, DataType> dataColumnTypes) {
         if (parts.length == 0) {
-            return false;
+            return Optional.empty();
         }
         DataType current = dataColumnTypes.get(parts[0]);
         if (current == null) {
-            return false;
+            return Optional.empty();
         }
         for (int i = 1; i < parts.length; i++) {
             if (!(current instanceof StructType struct)) {
-                return false;
+                return Optional.empty();
             }
             Optional<StructField> field = findField(struct, parts[i]);
             if (field.isEmpty()) {
-                return false;
+                return Optional.empty();
             }
             current = field.get().dataType();
         }
-        return true;
+        return Optional.of(current);
     }
 
     private static Optional<StructField> findField(StructType struct, String name) {
@@ -113,23 +114,25 @@ final class SparkPredicateToVortexExpression {
                 .findFirst();
     }
 
-    private static boolean isStructurallyPushable(Predicate predicate) {
+    private static boolean isStructurallyPushable(Predicate predicate, Map<String, DataType> dataColumnTypes) {
         if (predicate instanceof AlwaysTrue || predicate instanceof AlwaysFalse) {
             return true;
         }
         if (predicate instanceof And a) {
-            return isStructurallyPushable(a.left()) && isStructurallyPushable(a.right());
+            return isStructurallyPushable(a.left(), dataColumnTypes)
+                    && isStructurallyPushable(a.right(), dataColumnTypes);
         }
         if (predicate instanceof Or o) {
-            return isStructurallyPushable(o.left()) && isStructurallyPushable(o.right());
+            return isStructurallyPushable(o.left(), dataColumnTypes)
+                    && isStructurallyPushable(o.right(), dataColumnTypes);
         }
         if (predicate instanceof Not n) {
-            return isStructurallyPushable(n.child());
+            return isStructurallyPushable(n.child(), dataColumnTypes);
         }
 
         org.apache.spark.sql.connector.expressions.Expression[] children = predicate.children();
         return switch (predicate.name()) {
-            case "=", "<>", "!=", ">", ">=", "<", "<=" -> isPushableComparison(children);
+            case "=", "<>", "!=", ">", ">=", "<", "<=" -> isPushableComparison(children, dataColumnTypes);
             case "IS_NULL", "IS_NOT_NULL" -> children.length == 1 && isPushableFieldRef(children[0]);
             case "IN" -> {
                 if (children.length < 2 || !isPushableFieldRef(children[0])) {
@@ -224,14 +227,8 @@ final class SparkPredicateToVortexExpression {
     }
 
     private static Optional<Expression> convertComparison(
-            String op, org.apache.spark.sql.connector.expressions.Expression[] children, FieldResolver resolver) {
+            String name, org.apache.spark.sql.connector.expressions.Expression[] children, FieldResolver resolver) {
         if (children.length != 2) {
-            return Optional.empty();
-        }
-        // Allow either side to be the column; Spark's V2 builder sometimes commutes.
-        Optional<Expression> lhs = exprOf(children[0], resolver);
-        Optional<Expression> rhs = exprOf(children[1], resolver);
-        if (lhs.isEmpty() || rhs.isEmpty()) {
             return Optional.empty();
         }
         // We require at least one side to be a column reference to keep the surface small and to
@@ -241,14 +238,69 @@ final class SparkPredicateToVortexExpression {
         if (!lhsIsCol && !rhsIsCol) {
             return Optional.empty();
         }
-        BinaryOp binaryOp = toBinaryOp(op);
-        // Canonicalize so the column is on the left when only one side is a column.
+        // Allow either side to be the column; Spark's V2 builder sometimes commutes. Canonicalize so
+        // the column is on the left when only one side is a column.
+        BinaryOp op = toBinaryOp(name);
+        org.apache.spark.sql.connector.expressions.Expression column = children[0];
+        org.apache.spark.sql.connector.expressions.Expression other = children[1];
         if (!lhsIsCol) {
-            binaryOp = swap(binaryOp);
-            Expression tmp = lhs.get();
-            return Optional.of(Expression.binary(binaryOp, rhs.get(), tmp));
+            op = swap(op);
+            column = children[1];
+            other = children[0];
         }
-        return Optional.of(Expression.binary(binaryOp, lhs.get(), rhs.get()));
+        Optional<Expression> lhs = columnOf(column, resolver);
+        if (lhs.isEmpty()) {
+            return Optional.empty();
+        }
+        if (isFieldRefExpr(other)) {
+            BinaryOp columnOp = op;
+            return columnOf(other, resolver).map(rhs -> Expression.binary(columnOp, lhs.get(), rhs));
+        }
+        return compareToLiteral(op, lhs.get(), other);
+    }
+
+    /**
+     * Builds {@code column <op> literal}.
+     *
+     * <p>Spark compares floating point values with {@code -0.0 = 0.0} (see Spark's {@code SQLOrderingUtil}), whereas
+     * Vortex orders them totally with {@code -0.0 < 0.0}. A comparison against a zero literal is therefore expressed
+     * through both zeros, which is correct under Vortex's order. The other special values agree for the canonical
+     * {@code NaN} that Spark writes, which both engines treat as equal to itself and greater than every other value; a
+     * {@code NaN} with another bit pattern, written by another tool, is ordered differently by Vortex.
+     */
+    private static Optional<Expression> compareToLiteral(
+            BinaryOp op, Expression column, org.apache.spark.sql.connector.expressions.Expression literal) {
+        if (literal instanceof Literal<?> lit && isFloatingPointZero(lit)) {
+            boolean isFloat = lit.dataType() instanceof FloatType;
+            Expression negativeZero = isFloat ? Expression.literal(-0.0f) : Expression.literal(-0.0d);
+            Expression positiveZero = isFloat ? Expression.literal(0.0f) : Expression.literal(0.0d);
+            return Optional.of(
+                    switch (op) {
+                        // Not `-0.0 <= column <= 0.0`: the scan fuses that into a between, whose negation is
+                        // wrong over a chunk where the column is all null.
+                        case EQ ->
+                            Expression.or(
+                                    Expression.binary(BinaryOp.EQ, column, negativeZero),
+                                    Expression.binary(BinaryOp.EQ, column, positiveZero));
+                        case NOT_EQ ->
+                            Expression.or(
+                                    Expression.binary(BinaryOp.LT, column, negativeZero),
+                                    Expression.binary(BinaryOp.GT, column, positiveZero));
+                        case LT -> Expression.binary(BinaryOp.LT, column, negativeZero);
+                        case LTE -> Expression.binary(BinaryOp.LTE, column, positiveZero);
+                        case GT -> Expression.binary(BinaryOp.GT, column, positiveZero);
+                        case GTE -> Expression.binary(BinaryOp.GTE, column, negativeZero);
+                        default -> throw new IllegalArgumentException("not a comparison operator: " + op);
+                    });
+        }
+        return literalOf(literal).map(value -> Expression.binary(op, column, value));
+    }
+
+    private static boolean isFloatingPointZero(Literal<?> literal) {
+        DataType dataType = literal.dataType();
+        return (dataType instanceof FloatType || dataType instanceof DoubleType)
+                && literal.value() instanceof Number number
+                && number.doubleValue() == 0.0;
     }
 
     private static Optional<Expression> convertIn(
@@ -263,11 +315,11 @@ final class SparkPredicateToVortexExpression {
         Expression columnExpr = column.get();
         List<Expression> eqs = new ArrayList<>(children.length - 1);
         for (int i = 1; i < children.length; i++) {
-            Optional<Expression> literal = literalOf(children[i]);
-            if (literal.isEmpty()) {
+            Optional<Expression> eq = compareToLiteral(BinaryOp.EQ, columnExpr, children[i]);
+            if (eq.isEmpty()) {
                 return Optional.empty();
             }
-            eqs.add(Expression.binary(BinaryOp.EQ, columnExpr, literal.get()));
+            eqs.add(eq.get());
         }
         if (eqs.size() == 1) {
             return Optional.of(eqs.get(0));
@@ -339,23 +391,33 @@ final class SparkPredicateToVortexExpression {
         };
     }
 
-    private static boolean isPushableComparison(org.apache.spark.sql.connector.expressions.Expression[] children) {
+    private static boolean isPushableComparison(
+            org.apache.spark.sql.connector.expressions.Expression[] children, Map<String, DataType> dataColumnTypes) {
         if (children.length != 2) {
             return false;
         }
         boolean lhsCol = isPushableFieldRef(children[0]);
-        boolean lhsLit = isPushableLiteral(children[0]);
         boolean rhsCol = isPushableFieldRef(children[1]);
-        boolean rhsLit = isPushableLiteral(children[1]);
-        boolean lhsOk = lhsCol || lhsLit;
-        boolean rhsOk = rhsCol || rhsLit;
+        if (lhsCol && rhsCol) {
+            // Spark treats -0.0 and 0.0 as equal while Vortex orders them. `compareToLiteral` rewrites
+            // comparisons against a zero literal; comparing two float columns is left to Spark.
+            return !isFloatingPointColumn(children[0], dataColumnTypes)
+                    && !isFloatingPointColumn(children[1], dataColumnTypes);
+        }
         // We need at least one column reference; otherwise the predicate is comparing two
         // constants — Spark normally folds those, so we don't bother.
-        return lhsOk && rhsOk && (lhsCol || rhsCol);
+        return (lhsCol && isPushableLiteral(children[1])) || (rhsCol && isPushableLiteral(children[0]));
     }
 
     private static boolean isPushableFieldRef(org.apache.spark.sql.connector.expressions.Expression expr) {
         return expr instanceof NamedReference && ((NamedReference) expr).fieldNames().length >= 1;
+    }
+
+    private static boolean isFloatingPointColumn(
+            org.apache.spark.sql.connector.expressions.Expression expr, Map<String, DataType> dataColumnTypes) {
+        return resolveFieldType(((NamedReference) expr).fieldNames(), dataColumnTypes)
+                .map(dataType -> dataType instanceof FloatType || dataType instanceof DoubleType)
+                .orElse(false);
     }
 
     private static boolean isFieldRefExpr(org.apache.spark.sql.connector.expressions.Expression expr) {
@@ -373,15 +435,6 @@ final class SparkPredicateToVortexExpression {
             return Optional.empty();
         }
         return resolver.resolve(parts);
-    }
-
-    private static Optional<Expression> exprOf(
-            org.apache.spark.sql.connector.expressions.Expression expr, FieldResolver resolver) {
-        Optional<Expression> col = columnOf(expr, resolver);
-        if (col.isPresent()) {
-            return col;
-        }
-        return literalOf(expr);
     }
 
     private static Optional<String> stringValueOf(org.apache.spark.sql.connector.expressions.Expression expr) {
