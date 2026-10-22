@@ -16,6 +16,7 @@ use jni::objects::JObjectArray;
 use jni::objects::JString;
 use jni::sys::jlong;
 use jni::sys::jobject;
+use url::Url;
 use vortex::buffer::ByteBuffer;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
@@ -205,6 +206,21 @@ pub extern "system" fn Java_dev_vortex_jni_NativeFiles_readMetadataFromReadable(
     })
 }
 
+/// The URL of a listed object: `root` is the URL the listing was requested for and `key` the
+/// object's key as the store reports it, which is literal rather than percent-encoded.
+///
+/// Opening a URL percent-decodes its path (`Path::from_url_path`), so every character the decoder
+/// would touch is encoded here, `%` included: `Url::set_path` leaves `%` alone, so a key such as
+/// `p=a%2Fb/part.vortex` (a Hive-escaped `/`) would reopen as the non-existent `p=a/b/part.vortex`.
+fn listed_url(root: &Url, key: &str) -> VortexResult<Url> {
+    let mut url = root.clone();
+    url.path_segments_mut()
+        .map_err(|()| vortex_err!("cannot list files under a URL without a path: {root}"))?
+        .clear()
+        .extend(key.split('/'));
+    Ok(url)
+}
+
 /// List Vortex files under the given URI prefix. Returns a `java.util.ArrayList<String>`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_vortex_jni_NativeFiles_listFiles(
@@ -228,9 +244,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativeFiles_listFiles(
         let paths_vec = RUNTIME.block_on(async move {
             let mut paths = Vec::new();
             while let Some(file) = stream.next().await {
-                let mut found = url.clone();
-                found.set_path(&file?.path);
-                paths.push(found.to_string());
+                paths.push(listed_url(&url, &file?.path)?.to_string());
             }
 
             VortexResult::Ok(paths)
@@ -276,20 +290,50 @@ pub extern "system" fn Java_dev_vortex_jni_NativeFiles_delete(
             return Ok(());
         }
 
-        let store_url = parse_uri_or_path(&delete_uris[0])?;
-
         let properties = extract_properties(env, &options)?;
-
-        let (fs, _path) = object_store_fs(&store_url, &properties, session.handle())?;
 
         RUNTIME.block_on(async {
             for uri in delete_uris {
+                // Resolve each URL the way opening it does, so the percent-encoded path of a listed
+                // URL names the same object on delete as on read.
                 let url = parse_uri_or_path(&uri)?;
-                fs.delete(url.path()).await?;
+                let (fs, path) = object_store_fs(&url, &properties, session.handle())?;
+                fs.delete(&path).await?;
             }
             VortexResult::Ok(())
         })?;
 
         Ok(())
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::object_store::make_object_store;
+
+    /// A listed URL must reopen the object it names: opening percent-decodes the URL path, so the
+    /// decoded path has to be the literal key the store reported, whatever the key contains.
+    #[rstest]
+    #[case::plain("table/part-0.vortex")]
+    #[case::space("table/p=a b/part-0.vortex")]
+    #[case::hive_escaped_slash("table/p=a%2Fb/part-0.vortex")]
+    #[case::hive_escaped_percent("table/p=100%25/part-0.vortex")]
+    #[case::hash_and_question("table/p=a#b?c/part-0.vortex")]
+    #[case::plus("table/p=a+b/part-0.vortex")]
+    #[case::non_ascii("table/p=é/part-0.vortex")]
+    #[case::brackets("table/p=a[1]/part-0.vortex")]
+    fn test_listed_url_reopens_the_listed_key(#[case] key: &str) -> VortexResult<()> {
+        let properties =
+            HashMap::from_iter([("aws_region".to_string(), "eu-central-9".to_string())]);
+        for root in ["file:///table/", "s3://bucket/table"] {
+            let root = Url::parse(root).map_err(|e| vortex_err!("{e}"))?;
+            let listed = listed_url(&root, key)?;
+            let (_store, path) = make_object_store(&listed, &properties)?;
+            assert_eq!(path.as_ref(), key, "listed as {listed}");
+        }
+        Ok(())
+    }
 }
