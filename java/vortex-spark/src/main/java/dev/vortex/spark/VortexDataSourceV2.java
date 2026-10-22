@@ -12,6 +12,7 @@ import dev.vortex.spark.config.HadoopUtils;
 import dev.vortex.spark.read.PartitionPathUtils;
 import dev.vortex.spark.read.VortexBatchExec;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -55,9 +56,10 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
     /**
      * Infers the schema of the Vortex files specified in the options.
      *
-     * <p>This method examines one file, the first listed under the last of the provided paths, to determine the data
-     * schema. Currently, schema evolution and merging across multiple files is not supported. Partition columns and
-     * their types are inferred from the Hive-style {@code key=value} directories of every file.
+     * <p>This method examines one file to determine the data schema: the last of the provided paths, or, for a
+     * directory, the file with the lexicographically smallest path under it, so the choice does not depend on the order
+     * in which the storage lists files. Schema evolution and merging across multiple files is not supported. Partition
+     * columns and their types are inferred from the Hive-style {@code key=value} directories of every file.
      *
      * @param options the data source options containing file paths
      * @return the inferred Spark SQL schema
@@ -79,8 +81,8 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
 
         var formatOptions = buildDataSourceOptions(options.asCaseSensitiveMap());
 
-        // List each path once: the data schema comes from the first file listed under the last path, the partition
-        // columns from every file.
+        // List each path once: the data schema comes from the lexicographically first file under the last path, the
+        // partition columns from every file.
         List<List<String>> filesPerPath = paths.stream()
                 .map(path -> listVortexFiles(List.of(path), formatOptions))
                 .collect(Collectors.toList());
@@ -92,7 +94,7 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
                             + "or provide an explicit schema.",
                     shortName(), Iterables.getLast(paths)));
         }
-        String pathToInfer = lastPathFiles.get(0);
+        String pathToInfer = Collections.min(lastPathFiles);
         List<String> files = filesPerPath.stream().flatMap(List::stream).collect(Collectors.toList());
 
         StructType dataSchema;
