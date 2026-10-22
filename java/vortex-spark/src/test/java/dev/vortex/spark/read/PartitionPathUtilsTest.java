@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.math.BigDecimal;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -229,6 +230,14 @@ final class PartitionPathUtilsTest {
                 2.25,
                 PartitionPathUtils.createConstantVector(1, DataTypes.DoubleType, "2.25")
                         .getDouble(0));
+    }
+
+    @Test
+    @DisplayName("Decimal values materialize at the target precision and scale")
+    void decimalMaterializes() {
+        ConstantColumnVector vec =
+                PartitionPathUtils.createConstantVector(1, DataTypes.createDecimalType(10, 4), "12.34");
+        assertEquals(new BigDecimal("12.3400"), vec.getDecimal(0, 10, 4).toJavaBigDecimal());
     }
 
     @Test

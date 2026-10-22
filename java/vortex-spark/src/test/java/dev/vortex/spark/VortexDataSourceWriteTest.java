@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -320,6 +321,43 @@ public final class VortexDataSourceWriteTest {
         Dataset<Row> readDf =
                 spark.read().format("vortex").load(outputPath.toUri().toString());
         assertEquals(rows, readDf.select("id", "s").orderBy("id").collectAsList());
+    }
+
+    @Test
+    @DisplayName("Decimal partition columns are written in Spark's string form")
+    public void testDecimalPartitionColumn() {
+        List<Row> rows = Arrays.asList(
+                RowFactory.create(1, new BigDecimal("12.34")), RowFactory.create(2, new BigDecimal("-0.50")));
+        StructType schema = DataTypes.createStructType(Arrays.asList(
+                DataTypes.createStructField("id", DataTypes.IntegerType, false),
+                DataTypes.createStructField("dec", DataTypes.createDecimalType(10, 2), true)));
+        Path outputPath = tempDir.resolve("decimal_partitions");
+
+        spark.createDataFrame(rows, schema)
+                .write()
+                .format("vortex")
+                .partitionBy("dec")
+                .mode(SaveMode.Overwrite)
+                .save(outputPath.toString());
+
+        assertTrue(Files.isDirectory(outputPath.resolve("dec=12.34")), "expected directory dec=12.34");
+        assertTrue(Files.isDirectory(outputPath.resolve("dec=-0.50")), "expected directory dec=-0.50");
+        // Spark infers a fractional partition value as a double; the declared schema reads it as a decimal.
+        assertEquals(
+                Arrays.asList(RowFactory.create(1, 12.34), RowFactory.create(2, -0.5)),
+                spark.read()
+                        .format("vortex")
+                        .load(outputPath.toString())
+                        .orderBy("id")
+                        .collectAsList());
+        assertEquals(
+                rows,
+                spark.read()
+                        .format("vortex")
+                        .schema(schema)
+                        .load(outputPath.toString())
+                        .orderBy("id")
+                        .collectAsList());
     }
 
     @Test

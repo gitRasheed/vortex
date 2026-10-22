@@ -36,6 +36,7 @@ import org.apache.spark.sql.types.BooleanType;
 import org.apache.spark.sql.types.ByteType;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DateType;
+import org.apache.spark.sql.types.DecimalType;
 import org.apache.spark.sql.types.DoubleType;
 import org.apache.spark.sql.types.FloatType;
 import org.apache.spark.sql.types.IntegerType;
@@ -355,6 +356,11 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
         } else if (dataType instanceof StringType) {
             UTF8String str = row.getUTF8String(ordinal);
             return str != null ? str.toString() : HIVE_DEFAULT_PARTITION;
+        } else if (dataType instanceof DecimalType) {
+            // Spark's string form of a decimal, e.g. `12.34`, as Spark's own sources write it.
+            DecimalType decimalType = (DecimalType) dataType;
+            return row.getDecimal(ordinal, decimalType.precision(), decimalType.scale())
+                    .toString();
         } else if (dataType instanceof DateType) {
             return String.valueOf(row.getInt(ordinal));
         } else if (dataType instanceof TimestampType || dataType instanceof TimestampNTZType) {
