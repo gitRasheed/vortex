@@ -9,9 +9,12 @@ import com.google.common.primitives.Ints;
 import com.google.common.primitives.Longs;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import org.apache.spark.sql.execution.vectorized.ConstantColumnVector;
 import org.apache.spark.sql.types.BooleanType;
 import org.apache.spark.sql.types.ByteType;
@@ -82,12 +85,50 @@ public final class PartitionPathUtils {
     }
 
     /**
-     * Infers a Spark {@link DataType} from a partition value string. Tries integer, long, double, boolean, and falls
-     * back to string.
+     * Discovers the partition columns of a set of files and infers each column's type from the values of every file.
+     *
+     * @return the partition column names in path order, mapped to their inferred types
+     * @throws IllegalArgumentException if the files disagree on their partition columns
+     */
+    public static Map<String, DataType> inferPartitionColumnTypes(List<String> files) {
+        List<Map<String, String>> valuesPerFile =
+                files.stream().map(PartitionPathUtils::parsePartitionValues).collect(Collectors.toList());
+        Map<String, DataType> types = new LinkedHashMap<>();
+        for (String name : partitionColumnNames(files)) {
+            List<String> values = valuesPerFile.stream()
+                    .map(fileValues -> fileValues.get(name))
+                    .collect(Collectors.toList());
+            types.put(name, inferCommonPartitionColumnType(values));
+        }
+        return types;
+    }
+
+    /**
+     * Single-value form of {@link #inferCommonPartitionColumnType(Collection)}: infers a Spark {@link DataType} from
+     * one partition value string.
      */
     public static DataType inferPartitionColumnType(String value) {
+        return inferCommonPartitionColumnType(Collections.singletonList(value));
+    }
+
+    /**
+     * Infers the Spark {@link DataType} of a partition column from its values across every file. Each value is
+     * classified on its own as integer, long, double, boolean, string, or null ({@code __HIVE_DEFAULT_PARTITION__}),
+     * and the classes are widened pairwise like Spark's {@code PartitioningUtils.findWiderTypeForPartitionColumn}: null
+     * widens to any other type, integer widens to long or double, and every other mix falls back to string, in
+     * particular long with double, whose values a double cannot hold exactly. A column of only null values is a string.
+     */
+    public static DataType inferCommonPartitionColumnType(Collection<String> values) {
+        DataType common = DataTypes.NullType;
+        for (String value : values) {
+            common = widenPartitionColumnType(common, classifyPartitionValue(value));
+        }
+        return DataTypes.NullType.equals(common) ? DataTypes.StringType : common;
+    }
+
+    private static DataType classifyPartitionValue(String value) {
         if (value == null || HIVE_DEFAULT_PARTITION.equals(value)) {
-            return DataTypes.StringType;
+            return DataTypes.NullType;
         }
         if (Ints.tryParse(value) != null) {
             return DataTypes.IntegerType;
@@ -102,6 +143,27 @@ public final class PartitionPathUtils {
             return DataTypes.BooleanType;
         }
         return DataTypes.StringType;
+    }
+
+    /** Spark's partition column widening rule, restricted to the types {@link #classifyPartitionValue} produces. */
+    private static DataType widenPartitionColumnType(DataType left, DataType right) {
+        if (left.equals(right) || DataTypes.NullType.equals(right)) {
+            return left;
+        }
+        if (DataTypes.NullType.equals(left)) {
+            return right;
+        }
+        if (isPair(left, right, DataTypes.IntegerType, DataTypes.LongType)) {
+            return DataTypes.LongType;
+        }
+        if (isPair(left, right, DataTypes.IntegerType, DataTypes.DoubleType)) {
+            return DataTypes.DoubleType;
+        }
+        return DataTypes.StringType;
+    }
+
+    private static boolean isPair(DataType left, DataType right, DataType first, DataType second) {
+        return (left.equals(first) && right.equals(second)) || (left.equals(second) && right.equals(first));
     }
 
     /**
