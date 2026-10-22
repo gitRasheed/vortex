@@ -14,7 +14,9 @@ import java.sql.Date;
 import java.sql.Timestamp;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.spark.sql.Dataset;
@@ -532,6 +534,77 @@ public final class VortexFilterPushdownTest {
                 List.of(1, 3),
                 idsOf(readDf.filter(readDf.col("payload").equalTo(new byte[] {0x01, 0x02, 0x03}))
                         .orderBy("id")));
+    }
+
+    @Test
+    @DisplayName("Float and double comparisons against zero treat -0.0 and 0.0 as equal, like Spark")
+    public void testSignedZeroPushdown() throws IOException {
+        Dataset<Row> df = spark.createDataFrame(
+                Arrays.asList(
+                        RowFactory.create(1, -0.0f, -0.0d),
+                        RowFactory.create(2, 0.0f, 0.0d),
+                        RowFactory.create(3, -1.5f, -1.5d),
+                        RowFactory.create(4, 1.5f, 1.5d),
+                        RowFactory.create(5, Float.NaN, Double.NaN),
+                        RowFactory.create(6, null, null)),
+                DataTypes.createStructType(Arrays.asList(
+                        DataTypes.createStructField("id", DataTypes.IntegerType, false),
+                        DataTypes.createStructField("f", DataTypes.FloatType, true),
+                        DataTypes.createStructField("d", DataTypes.DoubleType, true))));
+
+        Path outputPath = tempDir.resolve("pushdown_signed_zero");
+        df.write()
+                .format("vortex")
+                .option("path", outputPath.toUri().toString())
+                .mode(SaveMode.Overwrite)
+                .save();
+
+        Dataset<Row> readDf = spark.read()
+                .format("vortex")
+                .option("path", outputPath.toUri().toString())
+                .load();
+
+        // Vortex orders floats totally (-0.0 < 0.0), so the pushed comparison must be rewritten,
+        // not evaluated as is. `-0.0D` is a genuine negative zero literal; `-0.0` would parse as a
+        // decimal, which has no signed zero.
+        Map<String, List<Integer>> expected = new LinkedHashMap<>();
+        expected.put("%s = 0.0", List.of(1, 2));
+        expected.put("%s = -0.0D", List.of(1, 2));
+        expected.put("%s <> 0.0", List.of(3, 4, 5));
+        expected.put("%s < 0.0", List.of(3));
+        expected.put("%s <= -0.0D", List.of(1, 2, 3));
+        expected.put("%s > -0.0D", List.of(4, 5));
+        expected.put("%s >= 0.0", List.of(1, 2, 4, 5));
+        expected.put("%s IN (0.0, 1.5)", List.of(1, 2, 4));
+        for (String column : List.of("f", "d")) {
+            expected.forEach((template, ids) -> {
+                String filter = String.format(template, column);
+                assertEquals(ids, idsOf(readDf.filter(filter).orderBy("id")), filter);
+            });
+        }
+
+        // The comparison is still pushed down rather than left to Spark.
+        String plan = readDf.filter("d = 0.0").queryExecution().executedPlan().toString();
+        assertTrue(plan.contains("d = 0.0"), "Expected pushed predicate for d = 0.0 in the executed plan: " + plan);
+
+        // A negated comparison over a file whose column is all null keeps no rows, as in Spark.
+        Path allNullPath = tempDir.resolve("pushdown_signed_zero_all_null");
+        df.filter("id = 6")
+                .write()
+                .format("vortex")
+                .option("path", allNullPath.toUri().toString())
+                .mode(SaveMode.Overwrite)
+                .save();
+        Dataset<Row> allNull = spark.read()
+                .format("vortex")
+                .option("path", allNullPath.toUri().toString())
+                .load();
+        for (String column : List.of("f", "d")) {
+            for (String template : List.of("NOT (%s = 0.0 AND id > 0)", "NOT (%s = 0.0) OR id <= 0")) {
+                String filter = String.format(template, column);
+                assertEquals(List.of(), idsOf(allNull.filter(filter)), filter);
+            }
+        }
     }
 
     @Test
