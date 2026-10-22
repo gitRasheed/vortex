@@ -51,6 +51,15 @@ final class SparkPredicateToVortexExpression {
 
     private SparkPredicateToVortexExpression() {}
 
+    /** Resolves a Spark field path to the expression reading it, or returns empty when the file lacks the field. */
+    @FunctionalInterface
+    interface FieldResolver {
+        Optional<Expression> resolve(String[] fieldPath);
+    }
+
+    /** Reads every field path by its exact name, as if the file had every field the predicate references. */
+    static final FieldResolver BY_NAME = fieldPath -> Optional.of(Expression.column(fieldPath));
+
     /**
      * Returns true if the given Spark predicate can be translated to a Vortex expression and every named reference
      * resolves to a real field path under {@code dataColumnTypes}.
@@ -147,6 +156,17 @@ final class SparkPredicateToVortexExpression {
      * translated; callers should normally pre-check with {@link #isPushable}.
      */
     static Optional<Expression> convert(Predicate predicate) {
+        return convert(predicate, BY_NAME);
+    }
+
+    /**
+     * Converts a Spark predicate to a Vortex expression over one file, reading each field through {@code resolver}.
+     *
+     * <p>A field the file does not have reads as null, so a predicate over it takes the value it has for a null
+     * operand: {@code IS NULL} is true, {@code IS NOT NULL} is false, and every other predicate is null, which
+     * {@code AND}, {@code OR} and {@code NOT} combine by SQL three-valued logic.
+     */
+    static Optional<Expression> convert(Predicate predicate, FieldResolver resolver) {
         if (predicate instanceof AlwaysTrue) {
             return Optional.of(Expression.literal(true));
         }
@@ -154,49 +174,63 @@ final class SparkPredicateToVortexExpression {
             return Optional.of(Expression.literal(false));
         }
         if (predicate instanceof And a) {
-            Optional<Expression> left = convert(a.left());
-            Optional<Expression> right = convert(a.right());
+            Optional<Expression> left = convert(a.left(), resolver);
+            Optional<Expression> right = convert(a.right(), resolver);
             if (left.isPresent() && right.isPresent()) {
                 return Optional.of(Expression.and(left.get(), right.get()));
             }
             return Optional.empty();
         }
         if (predicate instanceof Or o) {
-            Optional<Expression> left = convert(o.left());
-            Optional<Expression> right = convert(o.right());
+            Optional<Expression> left = convert(o.left(), resolver);
+            Optional<Expression> right = convert(o.right(), resolver);
             if (left.isPresent() && right.isPresent()) {
                 return Optional.of(Expression.or(left.get(), right.get()));
             }
             return Optional.empty();
         }
         if (predicate instanceof Not n) {
-            return convert(n.child()).map(Expression::not);
+            return convert(n.child(), resolver).map(Expression::not);
         }
         org.apache.spark.sql.connector.expressions.Expression[] children = predicate.children();
+        for (org.apache.spark.sql.connector.expressions.Expression child : children) {
+            if (child instanceof NamedReference ref
+                    && ref.fieldNames().length > 0
+                    && resolver.resolve(ref.fieldNames()).isEmpty()) {
+                return Optional.of(
+                        switch (predicate.name()) {
+                            case "IS_NULL" -> Expression.literal(true);
+                            case "IS_NOT_NULL" -> Expression.literal(false);
+                            default -> Expression.nullLiteralBool();
+                        });
+            }
+        }
         return switch (predicate.name()) {
-            case "=", "<>", "!=", ">", ">=", "<", "<=" -> convertComparison(predicate.name(), children);
-            case "IS_NULL" -> children.length == 1 ? columnOf(children[0]).map(Expression::isNull) : Optional.empty();
+            case "=", "<>", "!=", ">", ">=", "<", "<=" -> convertComparison(predicate.name(), children, resolver);
+            case "IS_NULL" ->
+                children.length == 1 ? columnOf(children[0], resolver).map(Expression::isNull) : Optional.empty();
             case "IS_NOT_NULL" ->
-                children.length == 1 ? columnOf(children[0]).map(Expression::isNotNull) : Optional.empty();
-            case "IN" -> convertIn(children);
+                children.length == 1 ? columnOf(children[0], resolver).map(Expression::isNotNull) : Optional.empty();
+            case "IN" -> convertIn(children, resolver);
             case "STARTS_WITH" ->
-                convertStringMatch(children, /* leadingWildcard= */ false, /* trailingWildcard= */ true);
+                convertStringMatch(children, resolver, /* leadingWildcard= */ false, /* trailingWildcard= */ true);
             case "ENDS_WITH" ->
-                convertStringMatch(children, /* leadingWildcard= */ true, /* trailingWildcard= */ false);
-            case "CONTAINS" -> convertStringMatch(children, /* leadingWildcard= */ true, /* trailingWildcard= */ true);
-            case "BOOLEAN_EXPRESSION" -> children.length == 1 ? columnOf(children[0]) : Optional.empty();
+                convertStringMatch(children, resolver, /* leadingWildcard= */ true, /* trailingWildcard= */ false);
+            case "CONTAINS" ->
+                convertStringMatch(children, resolver, /* leadingWildcard= */ true, /* trailingWildcard= */ true);
+            case "BOOLEAN_EXPRESSION" -> children.length == 1 ? columnOf(children[0], resolver) : Optional.empty();
             default -> Optional.empty();
         };
     }
 
     private static Optional<Expression> convertComparison(
-            String op, org.apache.spark.sql.connector.expressions.Expression[] children) {
+            String op, org.apache.spark.sql.connector.expressions.Expression[] children, FieldResolver resolver) {
         if (children.length != 2) {
             return Optional.empty();
         }
         // Allow either side to be the column; Spark's V2 builder sometimes commutes.
-        Optional<Expression> lhs = exprOf(children[0]);
-        Optional<Expression> rhs = exprOf(children[1]);
+        Optional<Expression> lhs = exprOf(children[0], resolver);
+        Optional<Expression> rhs = exprOf(children[1], resolver);
         if (lhs.isEmpty() || rhs.isEmpty()) {
             return Optional.empty();
         }
@@ -217,11 +251,12 @@ final class SparkPredicateToVortexExpression {
         return Optional.of(Expression.binary(binaryOp, lhs.get(), rhs.get()));
     }
 
-    private static Optional<Expression> convertIn(org.apache.spark.sql.connector.expressions.Expression[] children) {
+    private static Optional<Expression> convertIn(
+            org.apache.spark.sql.connector.expressions.Expression[] children, FieldResolver resolver) {
         if (children.length < 2) {
             return Optional.empty();
         }
-        Optional<Expression> column = columnOf(children[0]);
+        Optional<Expression> column = columnOf(children[0], resolver);
         if (column.isEmpty()) {
             return Optional.empty();
         }
@@ -242,12 +277,13 @@ final class SparkPredicateToVortexExpression {
 
     private static Optional<Expression> convertStringMatch(
             org.apache.spark.sql.connector.expressions.Expression[] children,
+            FieldResolver resolver,
             boolean leadingWildcard,
             boolean trailingWildcard) {
         if (children.length != 2) {
             return Optional.empty();
         }
-        Optional<Expression> column = columnOf(children[0]);
+        Optional<Expression> column = columnOf(children[0], resolver);
         Optional<String> needle = stringValueOf(children[1]);
         if (column.isEmpty() || needle.isEmpty()) {
             return Optional.empty();
@@ -327,7 +363,8 @@ final class SparkPredicateToVortexExpression {
     }
 
     /** Returns the Vortex column expression for a Spark named reference, walking nested struct fields. */
-    private static Optional<Expression> columnOf(org.apache.spark.sql.connector.expressions.Expression expr) {
+    private static Optional<Expression> columnOf(
+            org.apache.spark.sql.connector.expressions.Expression expr, FieldResolver resolver) {
         if (!(expr instanceof NamedReference)) {
             return Optional.empty();
         }
@@ -335,11 +372,12 @@ final class SparkPredicateToVortexExpression {
         if (parts.length == 0) {
             return Optional.empty();
         }
-        return Optional.of(Expression.column(parts));
+        return resolver.resolve(parts);
     }
 
-    private static Optional<Expression> exprOf(org.apache.spark.sql.connector.expressions.Expression expr) {
-        Optional<Expression> col = columnOf(expr);
+    private static Optional<Expression> exprOf(
+            org.apache.spark.sql.connector.expressions.Expression expr, FieldResolver resolver) {
+        Optional<Expression> col = columnOf(expr, resolver);
         if (col.isPresent()) {
             return col;
         }

@@ -10,6 +10,7 @@ import dev.vortex.spark.VortexFilePartition;
 import dev.vortex.spark.VortexSparkSession;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -21,7 +22,7 @@ import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
-import org.apache.spark.sql.internal.SQLConf;
+import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 
 /** Execution source for batch scans of Vortex file tables. */
@@ -30,6 +31,7 @@ public final class VortexBatchExec implements Batch {
     private final StructType readSchema;
     private final Map<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
+    private final boolean caseSensitive;
     private List<String> resolvedPaths;
 
     /**
@@ -39,13 +41,20 @@ public final class VortexBatchExec implements Batch {
      * @param columns the list of columns to read from the files
      * @param pushedPredicates predicates pushed down by Spark; converted to a single Vortex filter expression at read
      *     time
+     * @param caseSensitive whether column and field names are matched against the files case-sensitively, as
+     *     {@code spark.sql.caseSensitive} said when the scan was planned
      */
     public VortexBatchExec(
-            List<String> paths, List<Column> columns, Map<String, String> formatOptions, Predicate[] pushedPredicates) {
+            List<String> paths,
+            List<Column> columns,
+            Map<String, String> formatOptions,
+            Predicate[] pushedPredicates,
+            boolean caseSensitive) {
         this.paths = List.copyOf(paths);
         this.readSchema = CatalogV2Util.v2ColumnsToStructType(columns.toArray(new Column[0]));
         this.formatOptions = Map.copyOf(formatOptions);
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
+        this.caseSensitive = caseSensitive;
     }
 
     /**
@@ -53,14 +62,16 @@ public final class VortexBatchExec implements Batch {
      *
      * <p>Directory-like entries are expanded to concrete {@code .vortex} files. Each resolved file becomes its own
      * {@link VortexFilePartition}; the partition carries the paths the reader should open, the requested schema, and
-     * any Hive-style partition values parsed out of the path.
+     * any Hive-style partition values parsed out of the path, keyed by the read schema's spelling of each column.
      */
     @Override
     public InputPartition[] planInputPartitions() {
         resolvedPaths = resolvePaths();
         return resolvedPaths.stream()
                 .map(path -> {
-                    Map<String, String> partVals = PartitionPathUtils.parsePartitionValues(path);
+                    Map<String, String> partVals = new LinkedHashMap<>();
+                    PartitionPathUtils.parsePartitionValues(path)
+                            .forEach((name, value) -> partVals.put(readSchemaName(name), value));
                     return new VortexFilePartition(
                             List.of(path), readSchema, formatOptions, ImmutableMap.copyOf(partVals));
                 })
@@ -70,12 +81,24 @@ public final class VortexBatchExec implements Batch {
     @Override
     public PartitionReaderFactory createReaderFactory() {
         List<String> files = resolvedPaths != null ? resolvedPaths : resolvePaths();
-        Set<String> partitionColumns = collectPartitionColumnNames(files);
+        Set<String> partitionColumns = collectPartitionColumnNames(files).stream()
+                .map(this::readSchemaName)
+                .collect(Collectors.toSet());
         List<String> dataColumnNames = Arrays.stream(readSchema.fieldNames())
                 .filter(name -> !partitionColumns.contains(name))
                 .collect(Collectors.toList());
-        return new VortexPartitionReaderFactory(
-                dataColumnNames, formatOptions, pushedPredicates, SQLConf.get().caseSensitiveAnalysis());
+        return new VortexPartitionReaderFactory(dataColumnNames, formatOptions, pushedPredicates, caseSensitive);
+    }
+
+    /**
+     * Returns the read schema's spelling of a partition column parsed from a path, or the path's own spelling when the
+     * read schema does not declare the column. The name matches exactly, or ignoring case when the session is
+     * case-insensitive, the same rule by which the reader binds data columns to the files.
+     */
+    private String readSchemaName(String partitionColumn) {
+        StructField field = VortexArrowColumnVector.findField(
+                Arrays.asList(readSchema.fields()), StructField::name, partitionColumn, caseSensitive);
+        return field == null ? partitionColumn : field.name();
     }
 
     private List<String> resolvePaths() {

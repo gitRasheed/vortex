@@ -42,6 +42,7 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
     // {@link VortexSparkSession} and is not released when this reader closes.
     private Session session;
     private DataSource dataSource;
+    private FileSchemaBinding binding;
     private Scan scan;
 
     private Partition currentPartition;
@@ -62,21 +63,22 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
         session = VortexSparkSession.get(formatOptions);
         dataSource = DataSource.open(session, spark.paths(), formatOptions);
 
+        binding = new FileSchemaBinding(dataSource.arrowSchema(allocator), dataColumnNames, caseSensitive);
+
         var options = ScanOptions.builder();
         if (!dataColumnNames.isEmpty()) {
-            Expression projection = Expression.select(dataColumnNames.toArray(new String[0]), Expression.root());
-            options.projection(projection);
+            options.projection(Expression.select(binding.presentFileNames(), Expression.root()));
         }
         if (pushedPredicates != null && pushedPredicates.length > 0) {
-            buildFilterExpression(pushedPredicates).ifPresent(options::filter);
+            buildFilterExpression(pushedPredicates, binding).ifPresent(options::filter);
         }
         scan = dataSource.scan(options.build());
     }
 
-    private static Optional<Expression> buildFilterExpression(Predicate[] predicates) {
+    private static Optional<Expression> buildFilterExpression(Predicate[] predicates, FileSchemaBinding binding) {
         Expression combined = null;
         for (Predicate predicate : predicates) {
-            Optional<Expression> expr = SparkPredicateToVortexExpression.convert(predicate);
+            Optional<Expression> expr = SparkPredicateToVortexExpression.convert(predicate, binding::resolve);
             if (expr.isEmpty()) {
                 continue;
             }
@@ -129,16 +131,17 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
         Map<String, String> partVals = spark.partitionValues();
         StructField[] fields = spark.readSchema().fields();
         ColumnVector[] columns = new ColumnVector[fields.length];
-        int dataIdx = 0;
         for (int i = 0; i < fields.length; i++) {
             StructField field = fields[i];
             String partValue = partVals.get(field.name());
             if (partValue != null) {
                 columns[i] = PartitionPathUtils.createConstantVector(rowCount, field.dataType(), partValue);
-            } else {
-                columns[i] = new VortexArrowColumnVector(
-                        root.getFieldVectors().get(dataIdx++), field.dataType(), caseSensitive);
+                continue;
             }
+            int index = binding.vectorIndex(field.name());
+            columns[i] = index < 0
+                    ? VortexArrowColumnVector.nulls(field.dataType(), rowCount)
+                    : new VortexArrowColumnVector(root.getFieldVectors().get(index), field.dataType(), caseSensitive);
         }
         return new ColumnarBatch(columns, rowCount);
     }
@@ -149,6 +152,7 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
         // Scan and DataSource native resources are released by VortexCleaner once
         // references are dropped. Session is the JVM-wide singleton and outlives this reader.
         scan = null;
+        binding = null;
         dataSource = null;
         session = null;
     }
