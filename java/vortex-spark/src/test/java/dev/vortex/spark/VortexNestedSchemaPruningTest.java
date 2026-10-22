@@ -6,11 +6,13 @@ package dev.vortex.spark;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
+import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SaveMode;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.functions;
@@ -34,6 +36,7 @@ public final class VortexNestedSchemaPruningTest {
     private static final List<Long> C_VALUES = List.of(300L, 301L, 302L, 303L, 304L);
 
     private SparkSession spark;
+    private String path;
     private Dataset<Row> table;
 
     @BeforeAll
@@ -62,7 +65,7 @@ public final class VortexNestedSchemaPruningTest {
                                 .struct(functions.lit("x").alias("p"), abc.alias("inner"))
                                 .alias("outer"));
 
-        String path = tempDir.resolve("nested").toUri().toString();
+        path = tempDir.resolve("nested").toUri().toString();
         df.write()
                 .format("vortex")
                 .option("path", path)
@@ -100,6 +103,23 @@ public final class VortexNestedSchemaPruningTest {
     @DisplayName("Selecting a field of a struct inside a struct returns that field")
     public void structInStructField() {
         assertEquals(C_VALUES, longsOf(functions.col("outer.inner.c")));
+    }
+
+    @Test
+    @DisplayName("A read schema that lists some struct fields, in its own order, reads each field by name")
+    public void readSchemaBindsStructFieldsByName() {
+        List<Row> rows = spark.read()
+                .format("vortex")
+                .schema("id bigint, s struct<c: bigint, a: bigint, z: bigint>, arr array<struct<c: bigint>>")
+                .load(path)
+                .orderBy("id")
+                .selectExpr("s.c", "s.a", "s.z", "arr[0].c")
+                .collectAsList();
+        List<Row> expected = new ArrayList<>();
+        for (long id = 0; id < 5; id++) {
+            expected.add(RowFactory.create(300 + id, 100 + id, null, 300 + id));
+        }
+        assertEquals(expected, rows);
     }
 
     private List<Long> longsOf(Column column) {

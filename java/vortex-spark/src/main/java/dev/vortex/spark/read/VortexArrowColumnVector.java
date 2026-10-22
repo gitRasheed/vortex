@@ -17,9 +17,15 @@ import dev.vortex.relocated.org.apache.arrow.vector.types.pojo.ArrowType;
 import dev.vortex.spark.ArrowUtils;
 import java.math.BigDecimal;
 import java.nio.ByteOrder;
+import java.util.List;
+import java.util.function.Function;
+import org.apache.spark.sql.types.ArrayType;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.Decimal;
+import org.apache.spark.sql.types.MapType;
+import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.vectorized.ColumnVector;
 import org.apache.spark.sql.vectorized.ColumnarArray;
 import org.apache.spark.sql.vectorized.ColumnarMap;
@@ -285,8 +291,29 @@ public class VortexArrowColumnVector extends ColumnVector {
      * @throws UnsupportedOperationException if the vector type is not supported
      */
     public VortexArrowColumnVector(ValueVector vector) {
-        this(ArrowUtils.fromArrowField(vector.getField()));
-        initAccessor(vector);
+        this(vector, ArrowUtils.fromArrowField(vector.getField()), true);
+    }
+
+    /**
+     * Creates a new VortexArrowColumnVector that presents the specified Arrow ValueVector as the
+     * Spark DataType a scan declared for it.
+     * <p>
+     * Struct children are bound to the declared fields by name rather than by position, so the
+     * declared struct may list a subset of the file's fields in any order, and a declared field
+     * the file does not have reads as null. Names match exactly, or ignoring case when
+     * {@code caseSensitive} is false and exactly one child matches. A declared type that disagrees
+     * with the file's type is rejected.
+     *
+     * @param vector the Arrow ValueVector to wrap
+     * @param type the Spark DataType the scan declared for this column
+     * @param caseSensitive whether nested field names are matched case-sensitively
+     * @throws IllegalArgumentException if the declared type does not match the vector, or a nested
+     *     field name is ambiguous ignoring case
+     * @throws UnsupportedOperationException if the vector type is not supported
+     */
+    public VortexArrowColumnVector(ValueVector vector, DataType type, boolean caseSensitive) {
+        this(type);
+        initAccessor(vector, type, caseSensitive);
     }
 
     private static VortexArrowColumnVector withAccessor(DataType type, ArrowVectorAccessor accessor) {
@@ -295,7 +322,91 @@ public class VortexArrowColumnVector extends ColumnVector {
         return column;
     }
 
-    void initAccessor(ValueVector vector) {
+    /**
+     * Creates a column of {@code valueCount} nulls of the given type, for a declared column or
+     * nested field that the file does not have.
+     *
+     * @param type the declared Spark DataType
+     * @param valueCount the number of rows
+     * @return a column whose every value is null
+     */
+    public static VortexArrowColumnVector nulls(DataType type, int valueCount) {
+        VortexArrowColumnVector column = withAccessor(type, new NullAccessor(new NullVector("missing", valueCount)));
+        if (type instanceof StructType struct) {
+            column.childColumns = new VortexArrowColumnVector[struct.length()];
+            for (int i = 0; i < struct.length(); i++) {
+                column.childColumns[i] = nulls(struct.fields()[i].dataType(), valueCount);
+            }
+        }
+        return column;
+    }
+
+    /**
+     * Finds the entry named {@code name} among {@code candidates}: by exact name, or, when
+     * {@code caseSensitive} is false and nothing matches exactly, by the one name that matches
+     * ignoring case.
+     *
+     * @return the matching entry, or null if there is none
+     * @throws IllegalArgumentException if several entries match ignoring case
+     */
+    static <T> T findField(List<T> candidates, Function<T, String> nameOf, String name, boolean caseSensitive) {
+        for (T candidate : candidates) {
+            if (nameOf.apply(candidate).equals(name)) {
+                return candidate;
+            }
+        }
+        if (caseSensitive) {
+            return null;
+        }
+        T found = null;
+        for (T candidate : candidates) {
+            if (nameOf.apply(candidate).equalsIgnoreCase(name)) {
+                if (found != null) {
+                    throw new IllegalArgumentException(String.format(
+                            "Field %s is ambiguous ignoring case: the Vortex file has both %s and %s",
+                            name, nameOf.apply(found), nameOf.apply(candidate)));
+                }
+                found = candidate;
+            }
+        }
+        return found;
+    }
+
+    private static void checkDeclaredType(ValueVector vector, DataType declared) {
+        DataType actual = ArrowUtils.fromArrowField(vector.getField());
+        boolean compatible;
+        if (declared instanceof StructType) {
+            compatible = actual instanceof StructType;
+        } else if (declared instanceof ArrayType) {
+            compatible = actual instanceof ArrayType;
+        } else if (declared instanceof MapType) {
+            compatible = actual instanceof MapType;
+        } else {
+            compatible = actual.equals(declared);
+        }
+        if (!compatible) {
+            throw new IllegalArgumentException(String.format(
+                    "Column %s has type %s in the Vortex file but the read schema declares %s",
+                    vector.getName(), actual.simpleString(), declared.simpleString()));
+        }
+    }
+
+    private static VortexArrowColumnVector[] bindStructChildren(
+            StructVector vector, StructType declared, boolean caseSensitive) {
+        List<FieldVector> children = vector.getChildrenFromFields();
+        StructField[] fields = declared.fields();
+        VortexArrowColumnVector[] bound = new VortexArrowColumnVector[fields.length];
+        for (int i = 0; i < fields.length; i++) {
+            FieldVector child = findField(children, FieldVector::getName, fields[i].name(), caseSensitive);
+            bound[i] = child == null
+                    ? nulls(fields[i].dataType(), vector.getValueCount())
+                    : new VortexArrowColumnVector(child, fields[i].dataType(), caseSensitive);
+        }
+        return bound;
+    }
+
+    void initAccessor(ValueVector vector, DataType type, boolean caseSensitive) {
+        checkDeclaredType(vector, type);
         if (vector instanceof BitVector bitVector) {
             accessor = new VortexArrowColumnVector.BooleanAccessor(bitVector);
         } else if (vector instanceof TinyIntVector tinyIntVector) {
@@ -336,18 +447,16 @@ public class VortexArrowColumnVector extends ColumnVector {
             accessor = new VortexArrowColumnVector.TimestampAccessor(timeStampVector);
         } else if (vector instanceof MapVector mapVector) {
             // MapVector extends ListVector, so this check must come first.
-            accessor = new VortexArrowColumnVector.MapAccessor(mapVector);
+            accessor = new VortexArrowColumnVector.MapAccessor(mapVector, (MapType) type, caseSensitive);
         } else if (vector instanceof ListVector listVector) {
-            accessor = new VortexArrowColumnVector.ArrayAccessor(listVector);
+            accessor = new VortexArrowColumnVector.ArrayAccessor(
+                    listVector, ((ArrayType) type).elementType(), caseSensitive);
         } else if (vector instanceof ListViewVector listViewVector) {
-            accessor = new VortexArrowColumnVector.ListViewAccessor(listViewVector);
+            accessor = new VortexArrowColumnVector.ListViewAccessor(
+                    listViewVector, ((ArrayType) type).elementType(), caseSensitive);
         } else if (vector instanceof StructVector structVector) {
             accessor = new VortexArrowColumnVector.StructAccessor(structVector);
-
-            childColumns = new VortexArrowColumnVector[structVector.size()];
-            for (int i = 0; i < childColumns.length; ++i) {
-                childColumns[i] = new VortexArrowColumnVector(structVector.getVectorById(i));
-            }
+            childColumns = bindStructChildren(structVector, (StructType) type, caseSensitive);
         } else if (vector instanceof NullVector nullVector) {
             accessor = new VortexArrowColumnVector.NullAccessor(nullVector);
         } else if (vector instanceof IntervalYearVector intervalYearVector) {
@@ -764,10 +873,10 @@ public class VortexArrowColumnVector extends ColumnVector {
         private final ListVector accessor;
         private final VortexArrowColumnVector arrayData;
 
-        ArrayAccessor(ListVector vector) {
+        ArrayAccessor(ListVector vector, DataType elementType, boolean caseSensitive) {
             super(vector);
             this.accessor = vector;
-            this.arrayData = new VortexArrowColumnVector(vector.getDataVector());
+            this.arrayData = new VortexArrowColumnVector(vector.getDataVector(), elementType, caseSensitive);
         }
 
         @Override
@@ -784,10 +893,10 @@ public class VortexArrowColumnVector extends ColumnVector {
         private final ListViewVector accessor;
         private final VortexArrowColumnVector arrayData;
 
-        ListViewAccessor(ListViewVector vector) {
+        ListViewAccessor(ListViewVector vector, DataType elementType, boolean caseSensitive) {
             super(vector);
             this.accessor = vector;
-            this.arrayData = new VortexArrowColumnVector(vector.getDataVector());
+            this.arrayData = new VortexArrowColumnVector(vector.getDataVector(), elementType, caseSensitive);
         }
 
         @Override
@@ -819,12 +928,14 @@ public class VortexArrowColumnVector extends ColumnVector {
         private final VortexArrowColumnVector keys;
         private final VortexArrowColumnVector values;
 
-        MapAccessor(MapVector vector) {
+        MapAccessor(MapVector vector, MapType type, boolean caseSensitive) {
             super(vector);
             this.accessor = vector;
             StructVector entries = (StructVector) vector.getDataVector();
-            this.keys = new VortexArrowColumnVector(entries.getChild(MapVector.KEY_NAME));
-            this.values = new VortexArrowColumnVector(entries.getChild(MapVector.VALUE_NAME));
+            this.keys = new VortexArrowColumnVector(
+                    entries.getChild(MapVector.KEY_NAME), type.keyType(), caseSensitive);
+            this.values = new VortexArrowColumnVector(
+                    entries.getChild(MapVector.VALUE_NAME), type.valueType(), caseSensitive);
         }
 
         @Override

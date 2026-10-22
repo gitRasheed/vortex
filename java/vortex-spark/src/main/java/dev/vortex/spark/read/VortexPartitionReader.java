@@ -35,6 +35,7 @@ import org.apache.spark.sql.vectorized.ColumnarBatch;
 final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
     private final VortexFilePartition spark;
     private final BufferAllocator allocator;
+    private final boolean caseSensitive;
 
     // Held so the DataSource/Scan stay reachable even if the JVM-wide singleton is
     // ever reset during a task; the actual native session is owned by
@@ -52,9 +53,11 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
             VortexFilePartition spark,
             List<String> dataColumnNames,
             Map<String, String> formatOptions,
-            Predicate[] pushedPredicates) {
+            Predicate[] pushedPredicates,
+            boolean caseSensitive) {
         this.spark = spark;
         this.allocator = ArrowAllocation.rootAllocator();
+        this.caseSensitive = caseSensitive;
 
         session = VortexSparkSession.get(formatOptions);
         dataSource = DataSource.open(session, spark.paths(), formatOptions);
@@ -124,27 +127,20 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
 
         int rowCount = root.getRowCount();
         Map<String, String> partVals = spark.partitionValues();
-        if (partVals.isEmpty()) {
-            ColumnVector[] vectors = new ColumnVector[root.getFieldVectors().size()];
-            for (int i = 0; i < vectors.length; i++) {
-                vectors[i] = new VortexArrowColumnVector(root.getFieldVectors().get(i));
-            }
-            return new ColumnarBatch(vectors, rowCount);
-        }
-
         StructField[] fields = spark.readSchema().fields();
-        ColumnVector[] combined = new ColumnVector[fields.length];
+        ColumnVector[] columns = new ColumnVector[fields.length];
         int dataIdx = 0;
         for (int i = 0; i < fields.length; i++) {
             StructField field = fields[i];
             String partValue = partVals.get(field.name());
             if (partValue != null) {
-                combined[i] = PartitionPathUtils.createConstantVector(rowCount, field.dataType(), partValue);
+                columns[i] = PartitionPathUtils.createConstantVector(rowCount, field.dataType(), partValue);
             } else {
-                combined[i] = new VortexArrowColumnVector(root.getFieldVectors().get(dataIdx++));
+                columns[i] = new VortexArrowColumnVector(
+                        root.getFieldVectors().get(dataIdx++), field.dataType(), caseSensitive);
             }
         }
-        return new ColumnarBatch(combined, rowCount);
+        return new ColumnarBatch(columns, rowCount);
     }
 
     @Override

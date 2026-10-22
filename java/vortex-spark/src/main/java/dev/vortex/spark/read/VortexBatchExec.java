@@ -21,6 +21,7 @@ import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
+import org.apache.spark.sql.internal.SQLConf;
 import org.apache.spark.sql.types.StructType;
 
 /** Execution source for batch scans of Vortex file tables. */
@@ -73,7 +74,8 @@ public final class VortexBatchExec implements Batch {
         List<String> dataColumnNames = Arrays.stream(readSchema.fieldNames())
                 .filter(name -> !partitionColumns.contains(name))
                 .collect(Collectors.toList());
-        return new VortexPartitionReaderFactory(dataColumnNames, formatOptions, pushedPredicates);
+        return new VortexPartitionReaderFactory(
+                dataColumnNames, formatOptions, pushedPredicates, SQLConf.get().caseSensitiveAnalysis());
     }
 
     private List<String> resolvePaths() {
