@@ -67,6 +67,7 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
     private final UnsafeProjection dataProjection;
     private final CaseInsensitiveStringMap options;
     private final ResolvedTransform[] resolvedTransforms;
+    private final String writeId;
     private final int partitionId;
     private final long taskId;
 
@@ -80,6 +81,7 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
      * @param schema the full schema of the data
      * @param options write options
      * @param resolvedTransforms pre-resolved partition transforms
+     * @param writeId identifier of the write job, embedded in every file name
      * @param partitionId the Spark partition ID
      * @param taskId the Spark task ID
      */
@@ -88,10 +90,12 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
             StructType schema,
             CaseInsensitiveStringMap options,
             ResolvedTransform[] resolvedTransforms,
+            String writeId,
             int partitionId,
             long taskId) {
         this.baseOutputUri = baseOutputUri.endsWith("/") ? baseOutputUri : baseOutputUri + "/";
         this.options = options;
+        this.writeId = writeId;
         this.partitionId = partitionId;
         this.taskId = taskId;
         this.resolvedTransforms = resolvedTransforms;
@@ -200,7 +204,7 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
     }
 
     private VortexDataWriter createWriterForPartition(String partitionPath) {
-        String fileName = String.format("part-%05d-%d.vortex", partitionId, taskId);
+        String fileName = String.format("part-%05d-%s-%d.vortex", partitionId, writeId, taskId);
         String fileUri = baseOutputUri + partitionPath + "/" + fileName;
         logger.debug("Creating writer for partition path: {}", fileUri);
         return new VortexDataWriter(fileUri, dataSchema, options);
