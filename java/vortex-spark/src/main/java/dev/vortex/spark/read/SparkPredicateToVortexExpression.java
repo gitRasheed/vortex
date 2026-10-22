@@ -449,7 +449,9 @@ final class SparkPredicateToVortexExpression {
         }
         Literal<?> lit = (Literal<?>) expr;
         DataType dataType = lit.dataType();
-        // Null literals are pushable (we emit a typed null literal).
+        // Null literals are pushable (we emit a typed null literal), except binary ones: Spark 4's
+        // `LiteralValue.toString` asserts a binary value is a `byte[]`, and Spark renders the pushed
+        // predicates while planning, so pushing one fails the query.
         if (lit.value() == null) {
             return dataType instanceof BooleanType
                     || dataType instanceof ByteType
@@ -459,7 +461,6 @@ final class SparkPredicateToVortexExpression {
                     || dataType instanceof FloatType
                     || dataType instanceof DoubleType
                     || (dataType instanceof StringType && !isCollatedString(dataType))
-                    || dataType instanceof BinaryType
                     || dataType instanceof DateType
                     || dataType instanceof TimestampType
                     || dataType instanceof TimestampNTZType
@@ -529,13 +530,8 @@ final class SparkPredicateToVortexExpression {
                 return Optional.of(Expression.literal(value.toString()));
             }
         }
-        if (dataType instanceof BinaryType) {
-            if (value == null) {
-                return Optional.of(Expression.nullLiteral(Expression.DType.BINARY));
-            }
-            if (value instanceof byte[]) {
-                return Optional.of(Expression.literal((byte[]) value));
-            }
+        if (dataType instanceof BinaryType && value instanceof byte[]) {
+            return Optional.of(Expression.literal((byte[]) value));
         }
         if (dataType instanceof DateType) {
             // Spark stores DateType as a 32-bit int day count since 1970-01-01.

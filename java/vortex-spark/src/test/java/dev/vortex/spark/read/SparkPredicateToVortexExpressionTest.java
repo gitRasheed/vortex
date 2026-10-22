@@ -79,7 +79,6 @@ final class SparkPredicateToVortexExpressionTest {
             "ratio",
             "weight",
             "name",
-            "payload",
             "birthday",
             "createdAt",
             "createdLocal",
@@ -255,6 +254,19 @@ final class SparkPredicateToVortexExpressionTest {
             assertPushableAndConvertible(
                     equality(ref(column), new LiteralValue<>(null, SCHEMA.get(column))), "null literal for " + column);
         }
+    }
+
+    @Test
+    @DisplayName("A null binary literal is left to Spark")
+    void nullBinaryLiteralIsRejected() {
+        // Spark 4's `LiteralValue.toString` asserts that a binary literal holds a `byte[]`, and Spark
+        // renders the pushed predicates while planning, so pushing `payload IN (X'00', NULL)` would
+        // fail the query with an INTERNAL_ERROR.
+        assertNotPushableAndNotConvertible(predicate(
+                "IN",
+                ref("payload"),
+                new LiteralValue<>(new byte[] {0}, DataTypes.BinaryType),
+                new LiteralValue<>(null, DataTypes.BinaryType)));
     }
 
     @Test
