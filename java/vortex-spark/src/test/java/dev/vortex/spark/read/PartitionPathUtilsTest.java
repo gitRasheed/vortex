@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import org.apache.spark.sql.execution.vectorized.ConstantColumnVector;
@@ -108,6 +109,37 @@ final class PartitionPathUtilsTest {
     void nullAndDefaultPartitionInferString() {
         assertEquals(DataTypes.StringType, PartitionPathUtils.inferPartitionColumnType(null));
         assertEquals(DataTypes.StringType, PartitionPathUtils.inferPartitionColumnType("__HIVE_DEFAULT_PARTITION__"));
+    }
+
+    // --- inferCommonPartitionColumnType ---
+
+    @Test
+    @DisplayName("Integer values widen to long or double across files")
+    void integerWidensToLongOrDouble() {
+        assertEquals(DataTypes.LongType, PartitionPathUtils.inferCommonPartitionColumnType(List.of("1", "3000000000")));
+        assertEquals(DataTypes.DoubleType, PartitionPathUtils.inferCommonPartitionColumnType(List.of("1", "1.5")));
+    }
+
+    @Test
+    @DisplayName("Long and double fall back to string rather than lose precision, like any other mix of kinds")
+    void mixedKindsFallBackToString() {
+        assertEquals(
+                DataTypes.StringType,
+                PartitionPathUtils.inferCommonPartitionColumnType(List.of("9007199254740993", "1.5")));
+        assertEquals(DataTypes.StringType, PartitionPathUtils.inferCommonPartitionColumnType(List.of("true", "1")));
+        assertEquals(DataTypes.StringType, PartitionPathUtils.inferCommonPartitionColumnType(List.of("1", "abc")));
+    }
+
+    @Test
+    @DisplayName("Null values take the type of the other values; a column of only nulls is a string")
+    void nullsWidenToTheOtherValues() {
+        assertEquals(
+                DataTypes.IntegerType,
+                PartitionPathUtils.inferCommonPartitionColumnType(
+                        Arrays.asList(null, "__HIVE_DEFAULT_PARTITION__", "7")));
+        assertEquals(
+                DataTypes.StringType,
+                PartitionPathUtils.inferCommonPartitionColumnType(Arrays.asList(null, "__HIVE_DEFAULT_PARTITION__")));
     }
 
     // --- createConstantVector ---

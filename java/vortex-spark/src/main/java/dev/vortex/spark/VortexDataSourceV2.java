@@ -11,11 +11,10 @@ import dev.vortex.api.DataSource;
 import dev.vortex.spark.config.HadoopUtils;
 import dev.vortex.spark.read.PartitionPathUtils;
 import dev.vortex.spark.read.VortexBatchExec;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.connector.catalog.Table;
 import org.apache.spark.sql.connector.catalog.TableProvider;
@@ -56,8 +55,9 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
     /**
      * Infers the schema of the Vortex files specified in the options.
      *
-     * <p>This method examines the last file in the provided paths to determine the schema. Currently, schema evolution
-     * and merging across multiple files is not supported.
+     * <p>This method examines one file, the first listed under the last of the provided paths, to determine the data
+     * schema. Currently, schema evolution and merging across multiple files is not supported. Partition columns and
+     * their types are inferred from the Hive-style {@code key=value} directories of every file.
      *
      * @param options the data source options containing file paths
      * @return the inferred Spark SQL schema
@@ -106,17 +106,20 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
             dataSchema = new StructType(fields);
         }
 
-        // Discover partition columns from Hive-style directory paths and append them. Every file must carry the
-        // same partition columns, or the reader would assemble rows from a different column layout than this schema.
-        PartitionPathUtils.partitionColumnNames(files);
-        Map<String, String> partitionValues = PartitionPathUtils.parsePartitionValues(pathToInfer);
-        if (!partitionValues.isEmpty()) {
-            Set<String> dataColumnNames = Stream.of(dataSchema.fieldNames()).collect(Collectors.toSet());
-            for (Map.Entry<String, String> entry : partitionValues.entrySet()) {
-                if (!dataColumnNames.contains(entry.getKey())) {
-                    DataType type = PartitionPathUtils.inferPartitionColumnType(entry.getValue());
-                    dataSchema = dataSchema.add(entry.getKey(), type, true);
-                }
+        // Discover partition columns from Hive-style directory paths. Every file must carry the same partition
+        // columns, and a column's type must fit the values of every file. As in Spark (though compared
+        // case-sensitively here), a partition column that shares its name with a data column keeps the data column's
+        // position but takes the partition type, since the reader substitutes the directory value for it.
+        Map<String, DataType> partitionTypes = PartitionPathUtils.inferPartitionColumnTypes(files);
+        for (Map.Entry<String, DataType> partition : partitionTypes.entrySet()) {
+            StructField field = new StructField(partition.getKey(), partition.getValue(), true, Metadata.empty());
+            int index = Arrays.asList(dataSchema.fieldNames()).indexOf(field.name());
+            if (index < 0) {
+                dataSchema = dataSchema.add(field);
+            } else {
+                StructField[] fields = dataSchema.fields().clone();
+                fields[index] = field;
+                dataSchema = new StructType(fields);
             }
         }
 
