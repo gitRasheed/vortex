@@ -583,6 +583,11 @@ public final class VortexFilterPushdownTest {
                 List.of(1, 3),
                 idsOf(readDf.filter(readDf.col("payload").equalTo(new byte[] {0x01, 0x02, 0x03}))
                         .orderBy("id")));
+
+        // A null binary literal stays with Spark: Spark 4 cannot render it in a pushed predicate.
+        assertEquals(
+                List.of(1, 3),
+                idsOf(readDf.filter("payload IN (X'010203', NULL)").orderBy("id")));
     }
 
     @Test
