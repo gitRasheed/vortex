@@ -9,12 +9,11 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Maps;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 import org.apache.spark.sql.connector.catalog.Column;
 import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.Transform;
@@ -23,6 +22,7 @@ import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.ScanBuilder;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.connector.read.SupportsPushDownV2Filters;
+import org.apache.spark.sql.internal.SQLConf;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.StructType;
 
@@ -33,7 +33,8 @@ public final class VortexScanBuilder
     private final List<Column> tableColumns;
     private final List<Column> readColumns;
     private final Map<String, String> formatOptions;
-    private final Set<String> partitionColumnNames;
+    private final List<String> partitionColumnNames;
+    private final boolean caseSensitive;
     private Predicate[] pushedPredicates = new Predicate[0];
 
     /** Creates a new VortexScanBuilder with empty paths and columns. */
@@ -45,6 +46,9 @@ public final class VortexScanBuilder
      * Creates a new VortexScanBuilder with empty paths and columns and the supplied partition transforms. Filters that
      * reference partition columns are not pushed down, since the partition columns are not stored inside the Vortex
      * files.
+     *
+     * <p>Column names are matched the way {@code spark.sql.caseSensitive} says at planning time, so the setting is
+     * captured here and carried to the executors with the scan.
      */
     public VortexScanBuilder(Map<String, String> formatOptions, Transform[] partitionTransforms) {
         this.paths = ImmutableList.builder();
@@ -55,6 +59,7 @@ public final class VortexScanBuilder
         this.readColumns = new ArrayList<>();
         this.formatOptions = options;
         this.partitionColumnNames = collectPartitionColumnNames(partitionTransforms);
+        this.caseSensitive = SQLConf.get().caseSensitiveAnalysis();
     }
 
     /**
@@ -124,7 +129,8 @@ public final class VortexScanBuilder
                 List.copyOf(this.tableColumns),
                 List.copyOf(this.readColumns),
                 pushedPredicates,
-                this.formatOptions);
+                this.formatOptions,
+                caseSensitive);
     }
 
     /**
@@ -152,7 +158,9 @@ public final class VortexScanBuilder
      *
      * <p>A predicate is pushed when it references only data columns (not partition columns) and uses operators and
      * literal types that {@link SparkPredicateToVortexExpression} can map to Vortex expressions. Predicates that
-     * reference partition columns or use unsupported features are returned to Spark for post-scan evaluation.
+     * reference partition columns or use unsupported features are returned to Spark for post-scan evaluation. A column
+     * is a partition column when its name matches a partition transform exactly, or ignoring case when the session is
+     * case-insensitive, the same rule by which the reader binds column names to the files.
      *
      * @return the predicates that Spark must still evaluate
      */
@@ -160,7 +168,9 @@ public final class VortexScanBuilder
     public Predicate[] pushPredicates(Predicate[] predicates) {
         Map<String, DataType> dataColumnTypes = new HashMap<>();
         for (Column column : readColumns) {
-            if (!partitionColumnNames.contains(column.name())) {
+            String partitionColumn = VortexArrowColumnVector.findField(
+                    partitionColumnNames, Function.identity(), column.name(), caseSensitive);
+            if (partitionColumn == null) {
                 dataColumnTypes.put(column.name(), column.dataType());
             }
         }
@@ -183,15 +193,15 @@ public final class VortexScanBuilder
         return Arrays.copyOf(pushedPredicates, pushedPredicates.length);
     }
 
-    private static Set<String> collectPartitionColumnNames(Transform[] transforms) {
+    private static List<String> collectPartitionColumnNames(Transform[] transforms) {
         if (transforms == null || transforms.length == 0) {
-            return Collections.emptySet();
+            return List.of();
         }
-        Set<String> names = new HashSet<>();
+        List<String> names = new ArrayList<>();
         for (Transform transform : transforms) {
             for (NamedReference ref : transform.references()) {
                 String[] parts = ref.fieldNames();
-                if (parts.length == 1) {
+                if (parts.length == 1 && !names.contains(parts[0])) {
                     names.add(parts[0]);
                 }
             }

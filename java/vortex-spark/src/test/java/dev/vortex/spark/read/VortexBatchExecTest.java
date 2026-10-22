@@ -29,7 +29,7 @@ final class VortexBatchExecTest {
             Column.create("name", org.apache.spark.sql.types.DataTypes.StringType));
 
     private static VortexBatchExec execFor(List<String> paths) {
-        return new VortexBatchExec(paths, COLUMNS, Map.of(), new Predicate[0]);
+        return new VortexBatchExec(paths, COLUMNS, Map.of(), new Predicate[0], false);
     }
 
     @Test
@@ -89,7 +89,8 @@ final class VortexBatchExecTest {
     @DisplayName("Format options are propagated to every partition")
     void formatOptionsPropagated() {
         Map<String, String> options = Map.of("vortex.workerThreads", "8");
-        VortexBatchExec exec = new VortexBatchExec(List.of("/data/a.vortex"), COLUMNS, options, new Predicate[0]);
+        VortexBatchExec exec =
+                new VortexBatchExec(List.of("/data/a.vortex"), COLUMNS, options, new Predicate[0], false);
 
         VortexFilePartition partition = (VortexFilePartition) exec.planInputPartitions()[0];
 
