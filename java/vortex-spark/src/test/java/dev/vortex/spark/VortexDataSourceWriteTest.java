@@ -12,6 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -24,6 +25,7 @@ import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SaveMode;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.catalyst.catalog.ExternalCatalogUtils;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.MapType;
 import org.apache.spark.sql.types.StructField;
@@ -282,6 +284,42 @@ public final class VortexDataSourceWriteTest {
         assertEquals(1, (int) groupA.collectAsList().get(0).getAs("id"));
         assertEquals(3, (int) groupA.collectAsList().get(1).getAs("id"));
         assertEquals(5, (int) groupA.collectAsList().get(2).getAs("id"));
+    }
+
+    @Test
+    @DisplayName("Partition values are escaped like Spark's own sources and read back intact")
+    public void testPartitionValuesEscapedLikeSpark() {
+        // `/` and `%` escape to percent sequences the listing used to hand back in a form that could not be reopened;
+        // the space and `+` tell Spark's escaping apart from URL form encoding.
+        List<String> values = List.of("a/b", "100%", "a b", "a+b", "k=v", "é", "2024-01-02 03:04:05");
+        List<Row> rows = new ArrayList<>();
+        for (int i = 0; i < values.size(); i++) {
+            rows.add(RowFactory.create(i, values.get(i)));
+        }
+        Dataset<Row> df = spark.createDataFrame(
+                rows,
+                DataTypes.createStructType(Arrays.asList(
+                        DataTypes.createStructField("id", DataTypes.IntegerType, false),
+                        DataTypes.createStructField("s", DataTypes.StringType, true))));
+        Path outputPath = tempDir.resolve("escaped_partitions");
+
+        // A URL base, as a catalog table location is: the native writer percent-decodes it. Overwriting the table
+        // deletes the listed files first, which exercises the listing on the same directories.
+        for (int i = 0; i < 2; i++) {
+            df.write()
+                    .format("vortex")
+                    .partitionBy("s")
+                    .mode(SaveMode.Overwrite)
+                    .save(outputPath.toUri().toString());
+        }
+
+        for (String value : values) {
+            String directory = ExternalCatalogUtils.getPartitionPathString("s", value);
+            assertTrue(Files.isDirectory(outputPath.resolve(directory)), "expected directory " + directory);
+        }
+        Dataset<Row> readDf =
+                spark.read().format("vortex").load(outputPath.toUri().toString());
+        assertEquals(rows, readDf.select("id", "s").orderBy("id").collectAsList());
     }
 
     @Test
