@@ -11,11 +11,13 @@ import dev.vortex.api.ScanOptions;
 import dev.vortex.api.Session;
 import dev.vortex.arrow.ArrowAllocation;
 import dev.vortex.relocated.org.apache.arrow.memory.BufferAllocator;
+import dev.vortex.relocated.org.apache.arrow.vector.FieldVector;
 import dev.vortex.relocated.org.apache.arrow.vector.VectorSchemaRoot;
 import dev.vortex.relocated.org.apache.arrow.vector.ipc.ArrowReader;
 import dev.vortex.spark.VortexFilePartition;
 import dev.vortex.spark.VortexSparkSession;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -127,8 +129,21 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
         }
 
         int rowCount = root.getRowCount();
+        List<FieldVector> dataVectors = root.getFieldVectors();
         Map<String, String> partVals = spark.partitionValues();
         StructField[] fields = spark.readSchema().fields();
+        if (dataVectors.size() != binding.presentFileNames().length) {
+            throw new IllegalStateException(String.format(
+                    "Scan of %s returned %d data columns but projected %s for the read schema %s (partition values: %s)",
+                    spark.paths(),
+                    dataVectors.size(),
+                    Arrays.toString(binding.presentFileNames()),
+                    spark.readSchema(),
+                    partVals));
+        }
+
+        // Partition columns are not stored in the files: each is a constant parsed from the file path, and every
+        // other column is bound to the vector the projected scan returned for it, or to nulls when the file lacks it.
         ColumnVector[] columns = new ColumnVector[fields.length];
         for (int i = 0; i < fields.length; i++) {
             StructField field = fields[i];
@@ -140,7 +155,7 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
             int index = binding.vectorIndex(field.name());
             columns[i] = index < 0
                     ? VortexArrowColumnVector.nulls(field.dataType(), rowCount)
-                    : new VortexArrowColumnVector(root.getFieldVectors().get(index), field.dataType(), caseSensitive);
+                    : new VortexArrowColumnVector(dataVectors.get(index), field.dataType(), caseSensitive);
         }
         return new ColumnarBatch(columns, rowCount);
     }
