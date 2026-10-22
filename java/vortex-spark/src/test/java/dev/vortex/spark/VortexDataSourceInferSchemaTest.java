@@ -7,6 +7,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.SaveMode;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -54,6 +57,28 @@ public final class VortexDataSourceInferSchemaTest {
                 allMessages.contains("no .vortex files found"),
                 "error should explain that no Vortex files were found, got: " + allMessages);
         assertTrue(allMessages.contains(emptyDir), "error should name the offending path, got: " + allMessages);
+    }
+
+    @Test
+    @DisplayName("Files inside and outside key=value directories are rejected as a conflicting layout")
+    public void mixedPartitionLayoutIsRejected() {
+        Path table = tempDir.resolve("mixed_layout");
+        Dataset<Row> rows = spark.range(2).toDF("id");
+        rows.write().format("vortex").mode(SaveMode.Append).save(table.toString());
+        rows.write()
+                .format("vortex")
+                .mode(SaveMode.Append)
+                .save(table.resolve("p=1").toString());
+
+        Throwable thrown = assertThrows(
+                Throwable.class,
+                () -> spark.read().format("vortex").load(table.toString()).collectAsList());
+
+        String allMessages = messagesOf(thrown);
+        assertTrue(
+                allMessages.contains("Conflicting partition column names"),
+                "error should explain the layout conflict, got: " + allMessages);
+        assertTrue(allMessages.contains("p=1"), "error should name an offending path, got: " + allMessages);
     }
 
     /** Concatenates the messages of the whole cause chain, since Spark may wrap data source exceptions. */

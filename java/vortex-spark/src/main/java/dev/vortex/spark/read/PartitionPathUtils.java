@@ -10,6 +10,7 @@ import com.google.common.primitives.Longs;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import org.apache.spark.sql.execution.vectorized.ConstantColumnVector;
 import org.apache.spark.sql.types.BooleanType;
@@ -50,6 +51,34 @@ public final class PartitionPathUtils {
             }
         }
         return values;
+    }
+
+    /**
+     * Returns the partition column names shared by every file, in path order.
+     *
+     * <p>Like Spark's own partition discovery (though names are compared case-sensitively here), every file must sit
+     * under the same {@code key=value} directory levels. A file outside the partition directories, or one missing a
+     * level, would otherwise be read with a different column layout than the table schema describes.
+     *
+     * @throws IllegalArgumentException if the files disagree on their partition columns
+     */
+    public static List<String> partitionColumnNames(List<String> files) {
+        List<String> expected = null;
+        String expectedPath = null;
+        for (String path : files) {
+            List<String> names = List.copyOf(parsePartitionValues(path).keySet());
+            if (expected == null) {
+                expected = names;
+                expectedPath = path;
+            } else if (!expected.equals(names)) {
+                throw new IllegalArgumentException(String.format(
+                        "Conflicting partition column names detected: %s has partition columns %s but %s has %s. "
+                                + "Every file of a partitioned table must sit under the same key=value directory "
+                                + "levels.",
+                        expectedPath, expected, path, names));
+            }
+        }
+        return expected == null ? List.of() : expected;
     }
 
     /**

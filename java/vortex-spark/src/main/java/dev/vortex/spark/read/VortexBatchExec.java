@@ -82,10 +82,11 @@ public final class VortexBatchExec implements Batch {
 
     /**
      * Expands directory-like entries to concrete {@code .vortex} files; entries that already name a {@code .vortex}
-     * file are kept as-is. Shared with {@link VortexScan#estimateStatistics()} so planning and execution resolve paths
-     * identically.
+     * file are kept as-is. Shared with {@link VortexScan#estimateStatistics()} and schema inference so planning and
+     * execution resolve paths identically.
      */
-    static List<String> resolveVortexPaths(Session session, List<String> paths, Map<String, String> formatOptions) {
+    public static List<String> resolveVortexPaths(
+            Session session, List<String> paths, Map<String, String> formatOptions) {
         return paths.stream()
                 .flatMap(path -> path.endsWith(".vortex")
                         ? Stream.of(path)

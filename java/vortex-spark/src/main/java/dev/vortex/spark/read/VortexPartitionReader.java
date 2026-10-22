@@ -11,11 +11,13 @@ import dev.vortex.api.ScanOptions;
 import dev.vortex.api.Session;
 import dev.vortex.arrow.ArrowAllocation;
 import dev.vortex.relocated.org.apache.arrow.memory.BufferAllocator;
+import dev.vortex.relocated.org.apache.arrow.vector.FieldVector;
 import dev.vortex.relocated.org.apache.arrow.vector.VectorSchemaRoot;
 import dev.vortex.relocated.org.apache.arrow.vector.ipc.ArrowReader;
 import dev.vortex.spark.VortexFilePartition;
 import dev.vortex.spark.VortexSparkSession;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -35,6 +37,8 @@ import org.apache.spark.sql.vectorized.ColumnarBatch;
 final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
     private final VortexFilePartition spark;
     private final BufferAllocator allocator;
+    // Read-schema columns the native scan must supply; the rest are partition columns parsed from the file path.
+    private final long dataColumns;
 
     // Held so the DataSource/Scan stay reachable even if the JVM-wide singleton is
     // ever reset during a task; the actual native session is owned by
@@ -55,6 +59,9 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
             Predicate[] pushedPredicates) {
         this.spark = spark;
         this.allocator = ArrowAllocation.rootAllocator();
+        this.dataColumns = Arrays.stream(spark.readSchema().fields())
+                .filter(field -> !spark.partitionValues().containsKey(field.name()))
+                .count();
 
         session = VortexSparkSession.get(formatOptions);
         dataSource = DataSource.open(session, spark.paths(), formatOptions);
@@ -123,16 +130,17 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
         }
 
         int rowCount = root.getRowCount();
+        List<FieldVector> dataVectors = root.getFieldVectors();
         Map<String, String> partVals = spark.partitionValues();
-        if (partVals.isEmpty()) {
-            ColumnVector[] vectors = new ColumnVector[root.getFieldVectors().size()];
-            for (int i = 0; i < vectors.length; i++) {
-                vectors[i] = new VortexArrowColumnVector(root.getFieldVectors().get(i));
-            }
-            return new ColumnarBatch(vectors, rowCount);
+        StructField[] fields = spark.readSchema().fields();
+        if (dataVectors.size() < dataColumns) {
+            throw new IllegalStateException(String.format(
+                    "Scan of %s returned %d data columns but the read schema %s needs %d (partition values: %s)",
+                    spark.paths(), dataVectors.size(), spark.readSchema(), dataColumns, partVals));
         }
 
-        StructField[] fields = spark.readSchema().fields();
+        // Partition columns are not stored in the files: the native scan returns the data columns in read-schema
+        // order and each partition column is a constant parsed from the file path.
         ColumnVector[] combined = new ColumnVector[fields.length];
         int dataIdx = 0;
         for (int i = 0; i < fields.length; i++) {
@@ -141,7 +149,7 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
             if (partValue != null) {
                 combined[i] = PartitionPathUtils.createConstantVector(rowCount, field.dataType(), partValue);
             } else {
-                combined[i] = new VortexArrowColumnVector(root.getFieldVectors().get(dataIdx++));
+                combined[i] = new VortexArrowColumnVector(dataVectors.get(dataIdx++));
             }
         }
         return new ColumnarBatch(combined, rowCount);

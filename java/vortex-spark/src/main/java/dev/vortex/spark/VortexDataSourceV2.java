@@ -8,12 +8,11 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import dev.vortex.api.DataSource;
-import dev.vortex.jni.NativeFiles;
 import dev.vortex.spark.config.HadoopUtils;
 import dev.vortex.spark.read.PartitionPathUtils;
+import dev.vortex.spark.read.VortexBatchExec;
+import java.util.List;
 import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -62,7 +61,8 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
      *
      * @param options the data source options containing file paths
      * @return the inferred Spark SQL schema
-     * @throws IllegalArgumentException if no Vortex files can be found under the supplied paths
+     * @throws IllegalArgumentException if no Vortex files can be found under the supplied paths, or if the files
+     *     disagree on their Hive-style partition columns
      * @throws RuntimeException if there's an error reading the file or converting the schema
      */
     @Override
@@ -79,23 +79,21 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
 
         var formatOptions = buildDataSourceOptions(options.asCaseSensitiveMap());
 
-        var pathToInfer = Objects.requireNonNull(Iterables.getLast(paths));
-        // If the path is a directory, scan the directory for a file and use that file
-        if (!pathToInfer.endsWith(".vortex")) {
-            Optional<String> firstFile =
-                    NativeFiles.listFiles(VortexSparkSession.get(formatOptions), pathToInfer, formatOptions).stream()
-                            .findFirst();
-
-            if (firstFile.isEmpty()) {
-                throw new IllegalArgumentException(String.format(
-                        "Unable to infer schema for %s: no .vortex files found under path %s. "
-                                + "Check that the path is correct and contains at least one Vortex file, "
-                                + "or provide an explicit schema.",
-                        shortName(), pathToInfer));
-            } else {
-                pathToInfer = firstFile.get();
-            }
+        // List each path once: the data schema comes from the first file listed under the last path, the partition
+        // columns from every file.
+        List<List<String>> filesPerPath = paths.stream()
+                .map(path -> listVortexFiles(List.of(path), formatOptions))
+                .collect(Collectors.toList());
+        List<String> lastPathFiles = Iterables.getLast(filesPerPath);
+        if (lastPathFiles.isEmpty()) {
+            throw new IllegalArgumentException(String.format(
+                    "Unable to infer schema for %s: no .vortex files found under path %s. "
+                            + "Check that the path is correct and contains at least one Vortex file, "
+                            + "or provide an explicit schema.",
+                    shortName(), Iterables.getLast(paths)));
         }
+        String pathToInfer = lastPathFiles.get(0);
+        List<String> files = filesPerPath.stream().flatMap(List::stream).collect(Collectors.toList());
 
         StructType dataSchema;
         {
@@ -108,7 +106,9 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
             dataSchema = new StructType(fields);
         }
 
-        // Discover partition columns from Hive-style directory paths and append them.
+        // Discover partition columns from Hive-style directory paths and append them. Every file must carry the
+        // same partition columns, or the reader would assemble rows from a different column layout than this schema.
+        PartitionPathUtils.partitionColumnNames(files);
         Map<String, String> partitionValues = PartitionPathUtils.parsePartitionValues(pathToInfer);
         if (!partitionValues.isEmpty()) {
             Set<String> dataColumnNames = Stream.of(dataSchema.fieldNames()).collect(Collectors.toSet());
@@ -124,7 +124,7 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
     }
 
     /**
-     * Infers partition transforms by inspecting Hive-style {@code key=value} segments in the first listed file path.
+     * Infers partition transforms by inspecting the Hive-style {@code key=value} segments of the listed file paths.
      *
      * <p>Spark calls this before {@link #getTable(StructType, Transform[], Map)} when the caller did not provide
      * explicit partitioning. Returning identity transforms here lets downstream components (notably
@@ -134,6 +134,8 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
      * <p>The options may contain no path at all: when a managed table is created ({@code CREATE TABLE ... USING vortex}
      * without a {@code LOCATION} clause), Spark's session catalog calls this before it has assigned the table's
      * warehouse location. No transforms are inferred in that case.
+     *
+     * @throws IllegalArgumentException if the files disagree on their partition columns
      */
     @Override
     public Transform[] inferPartitioning(CaseInsensitiveStringMap options) {
@@ -142,21 +144,13 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
             return new Transform[0];
         }
         var formatOptions = buildDataSourceOptions(options.asCaseSensitiveMap());
-        String pathToInfer = Objects.requireNonNull(Iterables.getLast(paths));
-        if (!pathToInfer.endsWith(".vortex")) {
-            Optional<String> firstFile =
-                    NativeFiles.listFiles(VortexSparkSession.get(formatOptions), pathToInfer, formatOptions).stream()
-                            .findFirst();
-            if (firstFile.isEmpty()) {
-                return new Transform[0];
-            }
-            pathToInfer = firstFile.get();
-        }
-        Map<String, String> partitionValues = PartitionPathUtils.parsePartitionValues(pathToInfer);
-        if (partitionValues.isEmpty()) {
-            return new Transform[0];
-        }
-        return partitionValues.keySet().stream().map(Expressions::identity).toArray(Transform[]::new);
+        return PartitionPathUtils.partitionColumnNames(listVortexFiles(paths, formatOptions)).stream()
+                .map(Expressions::identity)
+                .toArray(Transform[]::new);
+    }
+
+    private static List<String> listVortexFiles(List<String> paths, Map<String, String> formatOptions) {
+        return VortexBatchExec.resolveVortexPaths(VortexSparkSession.get(formatOptions), paths, formatOptions);
     }
 
     /**
