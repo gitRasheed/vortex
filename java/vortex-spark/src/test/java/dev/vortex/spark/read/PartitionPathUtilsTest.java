@@ -20,7 +20,7 @@ import org.junit.jupiter.api.Test;
  * Unit tests for {@link PartitionPathUtils}, which discovers and materializes Hive-style partition columns from file
  * paths.
  *
- * <p>Characterizes partition-value parsing (including URL decoding and the {@code __HIVE_DEFAULT_PARTITION__}
+ * <p>Characterizes partition-value parsing (including Hive unescaping and the {@code __HIVE_DEFAULT_PARTITION__}
  * sentinel), partition column type inference, and constant-vector materialization for each supported type.
  */
 final class PartitionPathUtilsTest {
@@ -56,10 +56,20 @@ final class PartitionPathUtilsTest {
     }
 
     @Test
-    @DisplayName("URL-decodes both keys and values")
-    void urlDecodesKeysAndValues() {
+    @DisplayName("Unescapes Hive-escaped keys and values")
+    void unescapesKeysAndValues() {
         Map<String, String> values = PartitionPathUtils.parsePartitionValues("/tbl/city=New%20York/file.vortex");
         assertEquals(Map.of("city", "New York"), values);
+    }
+
+    @Test
+    @DisplayName("Decodes a URL's percent-encoding before the Hive escaping, and keeps a '+' literal")
+    void decodesUrlThenHiveEscaping() {
+        // The listing percent-encodes the Hive escape `%2F` as `%252F`; a bare path carries the directory literally.
+        assertEquals(Map.of("s", "a/b"), PartitionPathUtils.parsePartitionValues("file:///tbl/s=a%252Fb/file.vortex"));
+        assertEquals(Map.of("s", "a%2Fb"), PartitionPathUtils.parsePartitionValues("/tbl/s=a%252Fb/file.vortex"));
+        assertEquals(
+                Map.of("s", "a+b c"), PartitionPathUtils.parsePartitionValues("file:///tbl/s=a+b%20c/file.vortex"));
     }
 
     @Test

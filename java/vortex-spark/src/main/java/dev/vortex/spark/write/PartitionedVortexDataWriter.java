@@ -5,10 +5,9 @@ package dev.vortex.spark.write;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.primitives.ImmutableIntArray;
+import dev.vortex.spark.read.PartitionPathUtils;
 import java.io.IOException;
 import java.io.Serializable;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -23,6 +22,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import org.apache.hadoop.shaded.com.google.common.collect.Streams;
 import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.catalyst.catalog.ExternalCatalogUtils;
 import org.apache.spark.sql.catalyst.expressions.BoundReference;
 import org.apache.spark.sql.catalyst.expressions.UnsafeProjection;
 import org.apache.spark.sql.connector.expressions.Expression;
@@ -201,7 +201,11 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
 
     private VortexDataWriter createWriterForPartition(String partitionPath) {
         String fileName = String.format("part-%05d-%d.vortex", partitionId, taskId);
-        String fileUri = baseOutputUri + partitionPath + "/" + fileName;
+        // The native writer percent-decodes the path of a URL, so the Hive escapes of the partition directories must
+        // be encoded once more to survive it; a bare path is taken literally.
+        String directories =
+                PartitionPathUtils.isUrl(baseOutputUri) ? partitionPath.replace("%", "%25") : partitionPath;
+        String fileUri = baseOutputUri + directories + "/" + fileName;
         logger.debug("Creating writer for partition path: {}", fileUri);
         return new VortexDataWriter(fileUri, dataSchema, options);
     }
@@ -213,11 +217,8 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
                 sb.append("/");
             }
             ResolvedTransform rt = resolvedTransforms[i];
-            sb.append(URLEncoder.encode(rt.directoryKey, StandardCharsets.UTF_8));
-            sb.append("=");
-
-            String value = evaluateTransform(rt, row);
-            sb.append(URLEncoder.encode(value, StandardCharsets.UTF_8));
+            // Escape the way Spark's own sources do, so either reader can read the other's layout.
+            sb.append(ExternalCatalogUtils.getPartitionPathString(rt.directoryKey, evaluateTransform(rt, row)));
         }
         return sb.toString();
     }
