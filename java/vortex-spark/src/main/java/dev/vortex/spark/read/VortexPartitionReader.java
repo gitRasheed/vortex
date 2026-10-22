@@ -59,11 +59,10 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
         session = VortexSparkSession.get(formatOptions);
         dataSource = DataSource.open(session, spark.paths(), formatOptions);
 
-        var options = ScanOptions.builder();
-        if (!dataColumnNames.isEmpty()) {
-            Expression projection = Expression.select(dataColumnNames.toArray(new String[0]), Expression.root());
-            options.projection(projection);
-        }
+        // Always project, even with no columns: a scan without a projection reads every column,
+        // whereas an empty select only counts rows, which is all count(*) needs.
+        var options = ScanOptions.builder()
+                .projection(Expression.select(dataColumnNames.toArray(new String[0]), Expression.root()));
         if (pushedPredicates != null && pushedPredicates.length > 0) {
             buildFilterExpression(pushedPredicates).ifPresent(options::filter);
         }
