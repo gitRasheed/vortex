@@ -206,17 +206,36 @@ pub extern "system" fn Java_dev_vortex_jni_NativeFiles_readMetadataFromReadable(
     })
 }
 
-/// The URL of a listed object: `root` is the URL the listing was requested for and `key` the
-/// object's key as the store reports it, which is literal rather than percent-encoded.
+/// The URL of a listed object: `root` is the URL the listing was requested for, `prefix` the path
+/// of `root` within its store, and `key` the object's key as the store reports it, which is
+/// relative to the store root and literal rather than percent-encoded.
+///
+/// A store may be mounted below the URL authority (`hf://datasets/org/name/...` at the
+/// repository, `https://s3.<region>.amazonaws.com/<bucket>/...` at the bucket), so the key
+/// replaces only the `prefix` part of the root path: the segments above it are kept as written.
 ///
 /// Opening a URL percent-decodes its path (`Path::from_url_path`), so every character the decoder
-/// would touch is encoded here, `%` included: `Url::set_path` leaves `%` alone, so a key such as
-/// `p=a%2Fb/part.vortex` (a Hive-escaped `/`) would reopen as the non-existent `p=a/b/part.vortex`.
-fn listed_url(root: &Url, key: &str) -> VortexResult<Url> {
+/// would touch is encoded in the key, `%` included: `Url::set_path` leaves `%` alone, so a key
+/// such as `p=a%2Fb/part.vortex` (a Hive-escaped `/`) would reopen as the non-existent
+/// `p=a/b/part.vortex`.
+fn listed_url(root: &Url, prefix: &str, key: &str) -> VortexResult<Url> {
+    fn segments(path: &str) -> impl Iterator<Item = &str> {
+        path.split('/').filter(|segment| !segment.is_empty())
+    }
+    // Saturate as the registry does: a percent-encoded root segment may decode to several prefix
+    // segments.
+    let mount_depth = segments(root.path())
+        .count()
+        .saturating_sub(segments(prefix).count());
+    let mount = segments(root.path())
+        .take(mount_depth)
+        .collect::<Vec<_>>()
+        .join("/");
+
     let mut url = root.clone();
+    url.set_path(&format!("/{mount}"));
     url.path_segments_mut()
         .map_err(|()| vortex_err!("cannot list files under a URL without a path: {root}"))?
-        .clear()
         .extend(key.split('/'));
     Ok(url)
 }
@@ -244,7 +263,7 @@ pub extern "system" fn Java_dev_vortex_jni_NativeFiles_listFiles(
         let paths_vec = RUNTIME.block_on(async move {
             let mut paths = Vec::new();
             while let Some(file) = stream.next().await {
-                paths.push(listed_url(&url, &file?.path)?.to_string());
+                paths.push(listed_url(&url, &prefix, &file?.path)?.to_string());
             }
 
             VortexResult::Ok(paths)
@@ -315,7 +334,8 @@ mod tests {
     use crate::object_store::make_object_store;
 
     /// A listed URL must reopen the object it names: opening percent-decodes the URL path, so the
-    /// decoded path has to be the literal key the store reported, whatever the key contains.
+    /// decoded path has to be the literal key the store reported, whatever the key contains, and
+    /// the URL has to keep the segments above the store's mount point.
     #[rstest]
     #[case::plain("table/part-0.vortex")]
     #[case::space("table/p=a b/part-0.vortex")]
@@ -328,9 +348,16 @@ mod tests {
     fn test_listed_url_reopens_the_listed_key(#[case] key: &str) -> VortexResult<()> {
         let properties =
             HashMap::from_iter([("aws_region".to_string(), "eu-central-9".to_string())]);
-        for root in ["file:///table/", "s3://bucket/table"] {
+        for root in [
+            "file:///table/",
+            "s3://bucket/table",
+            // Mounted below the authority: at the repository and at the bucket.
+            "hf://datasets/org/name/table/",
+            "https://s3.us-east-1.amazonaws.com/bucket/table/",
+        ] {
             let root = Url::parse(root).map_err(|e| vortex_err!("{e}"))?;
-            let listed = listed_url(&root, key)?;
+            let (_store, prefix) = make_object_store(&root, &properties)?;
+            let listed = listed_url(&root, prefix.as_ref(), key)?;
             let (_store, path) = make_object_store(&listed, &properties)?;
             assert_eq!(path.as_ref(), key, "listed as {listed}");
         }
