@@ -164,8 +164,9 @@ final class VortexScanBuilderTest {
     // --- pruneColumns ---
 
     @Test
-    @DisplayName("Required columns keep their full table type, so readSchema matches what the reader returns")
-    void pruneColumnsKeepsTableTypes() {
+    @DisplayName("readSchema prunes the struct fields Spark does not require, in table column order, as the reader"
+            + " projects the pruned fields natively and checks the scan returns them")
+    void pruneColumnsPrunesStructFields() {
         StructType abc = new StructType()
                 .add("a", DataTypes.LongType)
                 .add("b", DataTypes.LongType)
@@ -182,7 +183,9 @@ final class VortexScanBuilderTest {
                 .add("id", DataTypes.IntegerType));
 
         assertEquals(
-                new StructType().add("id", DataTypes.IntegerType).add("s", abc),
+                new StructType()
+                        .add("id", DataTypes.IntegerType)
+                        .add("s", new StructType().add("c", DataTypes.LongType)),
                 builder.build().readSchema());
     }
 

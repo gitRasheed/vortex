@@ -16,8 +16,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-import org.apache.spark.sql.connector.catalog.CatalogV2Util;
-import org.apache.spark.sql.connector.catalog.Column;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
@@ -38,7 +36,7 @@ public final class VortexBatchExec implements Batch {
      * Creates a new VortexBatchExec for scanning the specified Vortex files.
      *
      * @param paths the list of file paths to scan
-     * @param columns the list of columns to read from the files
+     * @param readSchema the schema to read from the files, with struct fields pruned by {@link NestedProjection}
      * @param pushedPredicates predicates pushed down by Spark; converted to a single Vortex filter expression at read
      *     time
      * @param caseSensitive whether column and field names are matched against the files case-sensitively, as
@@ -46,12 +44,12 @@ public final class VortexBatchExec implements Batch {
      */
     public VortexBatchExec(
             List<String> paths,
-            List<Column> columns,
+            StructType readSchema,
             Map<String, String> formatOptions,
             Predicate[] pushedPredicates,
             boolean caseSensitive) {
         this.paths = List.copyOf(paths);
-        this.readSchema = CatalogV2Util.v2ColumnsToStructType(columns.toArray(new Column[0]));
+        this.readSchema = readSchema;
         this.formatOptions = Map.copyOf(formatOptions);
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
         this.caseSensitive = caseSensitive;
@@ -84,10 +82,10 @@ public final class VortexBatchExec implements Batch {
         Set<String> partitionColumns = collectPartitionColumnNames(files).stream()
                 .map(this::readSchemaName)
                 .collect(Collectors.toSet());
-        List<String> dataColumnNames = Arrays.stream(readSchema.fieldNames())
-                .filter(name -> !partitionColumns.contains(name))
-                .collect(Collectors.toList());
-        return new VortexPartitionReaderFactory(dataColumnNames, formatOptions, pushedPredicates, caseSensitive);
+        StructType readDataSchema = new StructType(Arrays.stream(readSchema.fields())
+                .filter(field -> !partitionColumns.contains(field.name()))
+                .toArray(StructField[]::new));
+        return new VortexPartitionReaderFactory(readDataSchema, formatOptions, pushedPredicates, caseSensitive);
     }
 
     /**

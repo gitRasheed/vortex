@@ -12,8 +12,8 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.function.Function;
+import org.apache.spark.sql.connector.catalog.CatalogV2Util;
 import org.apache.spark.sql.connector.catalog.Column;
 import org.apache.spark.sql.connector.expressions.NamedReference;
 import org.apache.spark.sql.connector.expressions.Transform;
@@ -24,6 +24,7 @@ import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.connector.read.SupportsPushDownV2Filters;
 import org.apache.spark.sql.internal.SQLConf;
 import org.apache.spark.sql.types.DataType;
+import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 
 /** Spark V2 {@link ScanBuilder} for table scans over Vortex files. */
@@ -31,7 +32,7 @@ public final class VortexScanBuilder
         implements ScanBuilder, SupportsPushDownRequiredColumns, SupportsPushDownV2Filters {
     private final ImmutableList.Builder<String> paths;
     private final List<Column> tableColumns;
-    private final List<Column> readColumns;
+    private StructType readSchema;
     private final Map<String, String> formatOptions;
     private final List<String> partitionColumnNames;
     private final boolean caseSensitive;
@@ -56,7 +57,6 @@ public final class VortexScanBuilder
         options.put("vortex.workerThreads", "4");
         options.putAll(formatOptions);
         this.tableColumns = new ArrayList<>();
-        this.readColumns = new ArrayList<>();
         this.formatOptions = options;
         this.partitionColumnNames = collectPartitionColumnNames(partitionTransforms);
         this.caseSensitive = SQLConf.get().caseSensitiveAnalysis();
@@ -81,7 +81,7 @@ public final class VortexScanBuilder
      */
     public VortexScanBuilder addColumn(Column column) {
         this.tableColumns.add(column);
-        this.readColumns.add(column);
+        this.readSchema = null;
         return this;
     }
 
@@ -127,30 +127,33 @@ public final class VortexScanBuilder
         return new VortexScan(
                 paths,
                 List.copyOf(this.tableColumns),
-                List.copyOf(this.readColumns),
+                readSchema(),
                 pushedPredicates,
                 this.formatOptions,
                 caseSensitive);
     }
 
     /**
-     * Prunes the columns to only include those specified in the required schema.
+     * Prunes the columns, and the struct fields within them, to those specified in the required schema.
      *
-     * <p>Spark may also prune fields inside struct, array and map columns, but the native scan only projects top-level
-     * columns and returns each one whole. Required columns therefore keep their table type, so that
-     * {@link VortexScan#readSchema()} describes the data the reader returns.
+     * <p>Spark may prune fields inside struct, array and map columns. Struct fields are pruned in the native scan as
+     * far as {@link NestedProjection} can express it; the rest of each required column is read whole. The reader
+     * returns each column as the type {@link VortexScan#readSchema()} declares, binding the fields the native scan
+     * returns by name and checking it returns the ones projected.
      *
-     * @param requiredSchema the schema specifying which columns are required
+     * @param requiredSchema the schema specifying which columns and nested fields are required
      */
     @Override
     public void pruneColumns(StructType requiredSchema) {
-        Set<String> required = Set.copyOf(Arrays.asList(requiredSchema.fieldNames()));
-        readColumns.clear();
-        for (Column column : tableColumns) {
-            if (required.contains(column.name())) {
-                readColumns.add(column);
-            }
-        }
+        readSchema = NestedProjection.readSchema(tableSchema(), requiredSchema);
+    }
+
+    private StructType tableSchema() {
+        return CatalogV2Util.v2ColumnsToStructType(tableColumns.toArray(new Column[0]));
+    }
+
+    private StructType readSchema() {
+        return readSchema != null ? readSchema : tableSchema();
     }
 
     /**
@@ -167,7 +170,7 @@ public final class VortexScanBuilder
     @Override
     public Predicate[] pushPredicates(Predicate[] predicates) {
         Map<String, DataType> dataColumnTypes = new HashMap<>();
-        for (Column column : readColumns) {
+        for (StructField column : readSchema().fields()) {
             String partitionColumn = VortexArrowColumnVector.findField(
                     partitionColumnNames, Function.identity(), column.name(), caseSensitive);
             if (partitionColumn == null) {

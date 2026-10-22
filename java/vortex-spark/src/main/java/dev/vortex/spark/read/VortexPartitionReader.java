@@ -16,12 +16,12 @@ import dev.vortex.relocated.org.apache.arrow.vector.ipc.ArrowReader;
 import dev.vortex.spark.VortexFilePartition;
 import dev.vortex.spark.VortexSparkSession;
 import java.io.IOException;
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.vectorized.ColumnVector;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 
@@ -52,7 +52,7 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
 
     VortexPartitionReader(
             VortexFilePartition spark,
-            List<String> dataColumnNames,
+            StructType readDataSchema,
             Map<String, String> formatOptions,
             Predicate[] pushedPredicates,
             boolean caseSensitive) {
@@ -63,16 +63,19 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
         session = VortexSparkSession.get(formatOptions);
         dataSource = DataSource.open(session, spark.paths(), formatOptions);
 
-        binding = new FileSchemaBinding(dataSource.arrowSchema(allocator), dataColumnNames, caseSensitive);
+        binding = new FileSchemaBinding(dataSource.arrowSchema(allocator), readDataSchema, caseSensitive);
 
         var options = ScanOptions.builder();
-        if (!dataColumnNames.isEmpty()) {
-            options.projection(Expression.select(binding.presentFileNames(), Expression.root()));
+        if (!readDataSchema.isEmpty()) {
+            options.projection(binding.projection());
         }
         if (pushedPredicates != null && pushedPredicates.length > 0) {
             buildFilterExpression(pushedPredicates, binding).ifPresent(options::filter);
         }
         scan = dataSource.scan(options.build());
+        if (!readDataSchema.isEmpty()) {
+            binding.checkShape(scan.arrowSchema(allocator));
+        }
     }
 
     private static Optional<Expression> buildFilterExpression(Predicate[] predicates, FileSchemaBinding binding) {

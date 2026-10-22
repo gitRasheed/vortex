@@ -36,7 +36,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
 
     private final List<String> paths;
     private final List<Column> tableColumns;
-    private final List<Column> readColumns;
+    private final StructType readSchema;
     private final Map<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
     private final boolean caseSensitive;
@@ -49,7 +49,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
      *
      * @param paths the list of Vortex file paths to scan
      * @param tableColumns the full table columns before projection pushdown
-     * @param readColumns the list of columns to read from the files
+     * @param readSchema the schema the scan returns: the required columns, with struct fields pruned
      * @param pushedPredicates predicates pushed down by Spark; {@code null} or empty means no pushdown
      * @param caseSensitive whether column and field names are matched against the files case-sensitively, as
      *     {@code spark.sql.caseSensitive} said when the scan was planned
@@ -57,13 +57,13 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
     public VortexScan(
             List<String> paths,
             List<Column> tableColumns,
-            List<Column> readColumns,
+            StructType readSchema,
             Predicate[] pushedPredicates,
             Map<String, String> formatOptions,
             boolean caseSensitive) {
         this.paths = paths;
         this.tableColumns = tableColumns;
-        this.readColumns = readColumns;
+        this.readSchema = readSchema;
         this.formatOptions = formatOptions;
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
         this.caseSensitive = caseSensitive;
@@ -72,13 +72,14 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
     /**
      * Returns the schema for the data that will be read by this scan.
      *
-     * <p>The schema is constructed from the read columns that were specified when this scan was created.
+     * <p>The columns Spark required, in table order, with the struct fields Spark did not require pruned where
+     * {@link NestedProjection} supports it. The reader returns each column as this type.
      *
      * @return the StructType representing the schema of the read data
      */
     @Override
     public StructType readSchema() {
-        return CatalogV2Util.v2ColumnsToStructType(readColumns.toArray(new Column[0]));
+        return readSchema;
     }
 
     /**
@@ -109,8 +110,8 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
     @Override
     public String description() {
         return String.format(
-                "VortexScan{paths=%s, columns=%s, pushedPredicates=%s}",
-                paths, readColumns, Arrays.toString(pushedPredicates));
+                "VortexScan{paths=%s, readSchema=%s, pushedPredicates=%s}",
+                paths, readSchema, Arrays.toString(pushedPredicates));
     }
 
     /**
@@ -122,7 +123,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
      */
     @Override
     public Batch toBatch() {
-        return new VortexBatchExec(paths, readColumns, formatOptions, pushedPredicates, caseSensitive);
+        return new VortexBatchExec(paths, readSchema, formatOptions, pushedPredicates, caseSensitive);
     }
 
     /**
@@ -181,8 +182,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
             return OptionalLong.empty();
         }
 
-        StructType tableSchema = CatalogV2Util.v2ColumnsToStructType(tableColumns.toArray(new Column[0]));
-        StructType readSchema = readSchema();
+        StructType tableSchema = tableSchema();
         int tableDefaultSize = tableSchema.defaultSize();
         if (tableDefaultSize <= 0) {
             return fileBytes;

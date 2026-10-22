@@ -38,13 +38,16 @@ final class VortexScanTest {
     void predicateArraysCannotReplaceTheScansPredicates() {
         Predicate predicate = new Predicate("IS_NULL", new Expression[] {Expressions.column("id")});
         Predicate[] predicates = {predicate};
-        VortexScan scan = new VortexScan(List.of(), List.of(), List.of(), predicates, Map.of(), false);
+        VortexScan scan = new VortexScan(List.of(), List.of(), new StructType(), predicates, Map.of(), false);
 
         predicates[0] = null;
         scan.pushedPredicates()[0] = null;
 
         assertArrayEquals(new Predicate[] {predicate}, scan.pushedPredicates());
         assertEquals(
-                0, new VortexScan(List.of(), List.of(), List.of(), null, Map.of(), false).pushedPredicates().length);
+                0,
+                new VortexScan(List.of(), List.of(), new StructType(), null, Map.of(), false)
+                        .pushedPredicates()
+                        .length);
     }
 }

@@ -9,9 +9,9 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import dev.vortex.spark.VortexFilePartition;
 import java.util.List;
 import java.util.Map;
-import org.apache.spark.sql.connector.catalog.Column;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.InputPartition;
+import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -24,12 +24,12 @@ import org.junit.jupiter.api.Test;
  */
 final class VortexBatchExecTest {
 
-    private static final List<Column> COLUMNS = List.of(
-            Column.create("id", org.apache.spark.sql.types.DataTypes.IntegerType),
-            Column.create("name", org.apache.spark.sql.types.DataTypes.StringType));
+    private static final StructType SCHEMA = new StructType()
+            .add("id", org.apache.spark.sql.types.DataTypes.IntegerType)
+            .add("name", org.apache.spark.sql.types.DataTypes.StringType);
 
     private static VortexBatchExec execFor(List<String> paths) {
-        return new VortexBatchExec(paths, COLUMNS, Map.of(), new Predicate[0], false);
+        return new VortexBatchExec(paths, SCHEMA, Map.of(), new Predicate[0], false);
     }
 
     @Test
@@ -89,8 +89,7 @@ final class VortexBatchExecTest {
     @DisplayName("Format options are propagated to every partition")
     void formatOptionsPropagated() {
         Map<String, String> options = Map.of("vortex.workerThreads", "8");
-        VortexBatchExec exec =
-                new VortexBatchExec(List.of("/data/a.vortex"), COLUMNS, options, new Predicate[0], false);
+        VortexBatchExec exec = new VortexBatchExec(List.of("/data/a.vortex"), SCHEMA, options, new Predicate[0], false);
 
         VortexFilePartition partition = (VortexFilePartition) exec.planInputPartitions()[0];
 

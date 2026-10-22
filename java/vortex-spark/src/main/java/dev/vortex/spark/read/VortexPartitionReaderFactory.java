@@ -3,18 +3,17 @@
 
 package dev.vortex.spark.read;
 
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import dev.vortex.jni.NativeRuntime;
 import dev.vortex.spark.VortexFilePartition;
 import java.io.Serializable;
-import java.util.List;
 import java.util.Map;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.expressions.filter.Predicate;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
+import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 
 /**
@@ -28,7 +27,7 @@ import org.apache.spark.sql.vectorized.ColumnarBatch;
 public final class VortexPartitionReaderFactory implements PartitionReaderFactory, Serializable {
     private static final long serialVersionUID = 1L;
 
-    private final ImmutableList<String> dataColumnNames;
+    private final StructType readDataSchema;
     private final ImmutableMap<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
     private final boolean caseSensitive;
@@ -36,15 +35,17 @@ public final class VortexPartitionReaderFactory implements PartitionReaderFactor
     /**
      * Creates a factory for readers over the given data columns.
      *
+     * @param readDataSchema the data columns to read, without partition columns, with struct fields pruned by
+     *     {@link NestedProjection}
      * @param caseSensitive whether column and nested field names are matched against the files case-sensitively, as
      *     {@code spark.sql.caseSensitive} says
      */
     public VortexPartitionReaderFactory(
-            List<String> dataColumnNames,
+            StructType readDataSchema,
             Map<String, String> formatOptions,
             Predicate[] pushedPredicates,
             boolean caseSensitive) {
-        this.dataColumnNames = ImmutableList.copyOf(dataColumnNames);
+        this.readDataSchema = readDataSchema;
         this.formatOptions = ImmutableMap.copyOf(formatOptions);
         this.pushedPredicates = pushedPredicates == null ? new Predicate[0] : pushedPredicates.clone();
         this.caseSensitive = caseSensitive;
@@ -59,7 +60,7 @@ public final class VortexPartitionReaderFactory implements PartitionReaderFactor
     public PartitionReader<ColumnarBatch> createColumnarReader(InputPartition partition) {
         NativeRuntime.setWorkerThreads(Integer.parseInt(formatOptions.getOrDefault("vortex.workerThreads", "4")));
         VortexFilePartition spark = (VortexFilePartition) partition;
-        return new VortexPartitionReader(spark, dataColumnNames, formatOptions, pushedPredicates, caseSensitive);
+        return new VortexPartitionReader(spark, readDataSchema, formatOptions, pushedPredicates, caseSensitive);
     }
 
     @Override
