@@ -115,8 +115,8 @@ public final class VortexDataSourceWriteTest {
         // Verify files have expected naming pattern
         for (Path file : vortexFiles) {
             assertTrue(
-                    file.getFileName().toString().matches("part-\\d{5}-\\d+\\.vortex"),
-                    "File should match pattern part-XXXXX-Y.vortex: " + file.getFileName());
+                    file.getFileName().toString().matches("part-\\d{5}-[0-9a-f-]{36}-\\d+\\.vortex"),
+                    "File should match pattern part-XXXXX-<uuid>-Y.vortex: " + file.getFileName());
         }
 
         // When: Read the Vortex files back

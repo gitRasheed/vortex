@@ -96,7 +96,7 @@ df.write()
     .save();
 ```
 
-Each Spark partition produces one output file named `part-{partitionId}-{taskId}.vortex`.
+Each Spark partition produces one output file named `part-{partitionId}-{writeId}-{taskAttemptId}.vortex`, where `writeId` is a UUID generated for each write job, so appends from different Spark applications never reuse a file name.
 
 ### Write Options
 

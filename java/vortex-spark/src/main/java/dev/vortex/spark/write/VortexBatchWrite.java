@@ -9,6 +9,7 @@ import java.io.Serializable;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.spark.sql.connector.expressions.Transform;
@@ -37,6 +38,9 @@ public final class VortexBatchWrite implements Write, BatchWrite, Serializable {
     // Resolved eagerly so that Spark Transform objects (Scala case classes that are not
     // Java-serializable) never reach the DataWriterFactory serialization boundary.
     private final PartitionedVortexDataWriter.ResolvedTransform[] resolvedTransforms;
+    // Spark task ids restart at zero for every SparkContext, so file names also carry an id that is
+    // unique to this write job, as Spark's own file writers do.
+    private final String writeId = UUID.randomUUID().toString();
 
     /**
      * Creates a new VortexBatchWrite.
@@ -97,7 +101,7 @@ public final class VortexBatchWrite implements Write, BatchWrite, Serializable {
             NativeFiles.delete(session, uris.toArray(new String[0]), options);
         }
 
-        return new VortexDataWriterFactory(outputPath, schema, options, resolvedTransforms);
+        return new VortexDataWriterFactory(outputPath, schema, options, resolvedTransforms, writeId);
     }
 
     /**

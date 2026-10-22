@@ -28,6 +28,7 @@ public final class VortexDataWriterFactory implements DataWriterFactory, Seriali
     // Store options as a serializable Map instead of CaseInsensitiveStringMap
     private final Map<String, String> options;
     private final PartitionedVortexDataWriter.ResolvedTransform[] resolvedTransforms;
+    private final String writeId;
 
     /**
      * Creates a new VortexDataWriterFactory.
@@ -36,16 +37,19 @@ public final class VortexDataWriterFactory implements DataWriterFactory, Seriali
      * @param schema the schema of the data to write
      * @param options additional write options
      * @param resolvedTransforms pre-resolved partition transforms (may be empty)
+     * @param writeId identifier of the write job, unique across Spark applications, embedded in every file name
      */
     VortexDataWriterFactory(
             String outputUri,
             StructType schema,
             Map<String, String> options,
-            PartitionedVortexDataWriter.ResolvedTransform[] resolvedTransforms) {
+            PartitionedVortexDataWriter.ResolvedTransform[] resolvedTransforms,
+            String writeId) {
         this.outputUri = outputUri;
         this.schema = schema;
         this.options = options;
         this.resolvedTransforms = resolvedTransforms;
+        this.writeId = writeId;
     }
 
     /**
@@ -67,11 +71,11 @@ public final class VortexDataWriterFactory implements DataWriterFactory, Seriali
         if (resolvedTransforms.length > 0) {
             log.debug("Creating partitioned writer with {} transforms", resolvedTransforms.length);
             return new PartitionedVortexDataWriter(
-                    outputUri, schema, optionsMap, resolvedTransforms, partitionId, taskId);
+                    outputUri, schema, optionsMap, resolvedTransforms, writeId, partitionId, taskId);
         }
 
         // Non-partitioned write: single file per task
-        String fileName = String.format("part-%05d-%d.vortex", partitionId, taskId);
+        String fileName = String.format("part-%05d-%s-%d.vortex", partitionId, writeId, taskId);
         String fileUri;
         if (outputUri.endsWith("/")) {
             fileUri = outputUri + fileName;
