@@ -46,10 +46,14 @@ final class VortexTableTest {
     }
 
     @Test
-    @DisplayName("Advertises exactly batch read, batch write and truncate")
-    void capabilitiesAreBatchReadWriteAndTruncate() {
+    @DisplayName("Advertises exactly batch read, batch write, truncate and dynamic overwrite")
+    void capabilitiesAreBatchReadWriteTruncateAndDynamicOverwrite() {
         assertEquals(
-                java.util.Set.of(TableCapability.BATCH_READ, TableCapability.BATCH_WRITE, TableCapability.TRUNCATE),
+                java.util.Set.of(
+                        TableCapability.BATCH_READ,
+                        TableCapability.BATCH_WRITE,
+                        TableCapability.TRUNCATE,
+                        TableCapability.OVERWRITE_DYNAMIC),
                 tableFor("/data/a.vortex").capabilities());
     }
 

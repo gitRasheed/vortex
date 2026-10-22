@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -227,6 +228,53 @@ public final class VortexDataSourceWriteTest {
                 .load();
 
         verifyDataContent(df2, readDf);
+    }
+
+    @Test
+    @DisplayName("Dynamic partition overwrite replaces only the partitions the job writes")
+    public void testDynamicPartitionOverwrite() {
+        String outputPath = tempDir.resolve("dynamic_overwrite").toUri().toString();
+        spark.range(9)
+                .selectExpr("id", "cast(id % 3 as int) as p")
+                .write()
+                .format("vortex")
+                .partitionBy("p")
+                .mode(SaveMode.Overwrite)
+                .save(outputPath);
+
+        spark.conf().set("spark.sql.sources.partitionOverwriteMode", "dynamic");
+        try {
+            spark.range(100, 102)
+                    .selectExpr("id", "cast(1 as int) as p")
+                    .write()
+                    .format("vortex")
+                    .partitionBy("p")
+                    .mode(SaveMode.Overwrite)
+                    .save(outputPath);
+        } finally {
+            spark.conf().unset("spark.sql.sources.partitionOverwriteMode");
+        }
+
+        // p=0 and p=2 are untouched, p=1 holds only the new rows.
+        List<Long> expected = List.of(0L, 2L, 3L, 5L, 6L, 8L, 100L, 101L);
+        assertEquals(expected, idsOf(outputPath));
+
+        // A misspelt mode fails instead of falling back to replacing the whole table.
+        assertThrows(Exception.class, () -> spark.range(200, 201)
+                .selectExpr("id", "cast(1 as int) as p")
+                .write()
+                .format("vortex")
+                .option("partitionOverwriteMode", "dynamc")
+                .partitionBy("p")
+                .mode(SaveMode.Overwrite)
+                .save(outputPath));
+        assertEquals(expected, idsOf(outputPath));
+    }
+
+    private List<Long> idsOf(String path) {
+        return spark.read().format("vortex").load(path).select("id").orderBy("id").collectAsList().stream()
+                .map(row -> row.getLong(0))
+                .collect(Collectors.toList());
     }
 
     @Test

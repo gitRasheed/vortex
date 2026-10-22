@@ -6,9 +6,13 @@ package dev.vortex.spark.write;
 import dev.vortex.jni.NativeFiles;
 import dev.vortex.spark.VortexSparkSession;
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.spark.sql.connector.expressions.Transform;
@@ -29,11 +33,21 @@ import org.slf4j.LoggerFactory;
  */
 public final class VortexBatchWrite implements Write, BatchWrite, Serializable {
 
+    /** What happens to the data already under the output path. */
+    enum OverwriteMode {
+        /** Keep every existing file (append). */
+        NONE,
+        /** Delete every existing file before the write starts. */
+        TRUNCATE,
+        /** At commit, delete the existing files of every partition the write produced; keep the other partitions. */
+        DYNAMIC_PARTITIONS
+    }
+
     private static final Logger log = LoggerFactory.getLogger(VortexBatchWrite.class);
     private final String outputPath;
     private final StructType schema;
     private final Map<String, String> options;
-    private final boolean overwrite;
+    private final OverwriteMode overwriteMode;
     // Resolved eagerly so that Spark Transform objects (Scala case classes that are not
     // Java-serializable) never reach the DataWriterFactory serialization boundary.
     private final PartitionedVortexDataWriter.ResolvedTransform[] resolvedTransforms;
@@ -44,20 +58,23 @@ public final class VortexBatchWrite implements Write, BatchWrite, Serializable {
      * @param outputPath the base path where Vortex files will be written
      * @param schema the schema of the data to write
      * @param options additional write options
-     * @param overwrite whether to overwrite existing files
+     * @param overwriteMode what happens to the files already under the output path
      * @param partitionTransforms partition transforms (may be empty)
      */
     VortexBatchWrite(
             String outputPath,
             StructType schema,
             Map<String, String> options,
-            boolean overwrite,
+            OverwriteMode overwriteMode,
             Transform[] partitionTransforms) {
         this.outputPath = outputPath;
         this.schema = schema;
         this.options = options;
-        this.overwrite = overwrite;
         this.resolvedTransforms = PartitionedVortexDataWriter.resolveTransforms(partitionTransforms, schema);
+        // An unpartitioned table is a single partition, so dynamically overwriting it replaces everything.
+        this.overwriteMode = overwriteMode == OverwriteMode.DYNAMIC_PARTITIONS && resolvedTransforms.length == 0
+                ? OverwriteMode.TRUNCATE
+                : overwriteMode;
     }
 
     /**
@@ -83,7 +100,7 @@ public final class VortexBatchWrite implements Write, BatchWrite, Serializable {
     @Override
     public DataWriterFactory createBatchWriterFactory(PhysicalWriteInfo info) {
         // Handle overwrite cleanup BEFORE writing starts
-        if (overwrite) {
+        if (overwriteMode == OverwriteMode.TRUNCATE) {
             var session = VortexSparkSession.get(options);
             var uris = NativeFiles.listFiles(session, outputPath, options);
             // Deleting the existing files is destructive and happens before the new data is written:
@@ -117,13 +134,29 @@ public final class VortexBatchWrite implements Write, BatchWrite, Serializable {
     /**
      * Commits the entire write job after all tasks complete successfully.
      *
-     * <p>This finalizes the write operation and ensures all Vortex files are properly written.
+     * <p>This finalizes the write operation and ensures all Vortex files are properly written. A dynamic partition
+     * overwrite deletes the previous files of every partition written by this job here, once the new files are in
+     * place, so a failed job leaves the existing partitions untouched.
      *
      * @param messages commit messages from all successful write tasks
      */
     @Override
     public void commit(WriterCommitMessage[] messages) {
         List<String> writtenFiles = extractFilePaths(messages);
+
+        if (overwriteMode == OverwriteMode.DYNAMIC_PARTITIONS) {
+            try {
+                deleteReplacedPartitionFiles(writtenFiles);
+            } catch (RuntimeException e) {
+                // If commit throws, Spark aborts the job and abort() deletes the new files, while some previous
+                // files may already be gone: that would lose the partitions. Keep both generations instead.
+                log.error(
+                        "Failed to delete the previous files of the partitions replaced under {}; the new files were"
+                                + " kept, so those partitions may hold duplicate rows until the overwrite is re-run",
+                        outputPath,
+                        e);
+            }
+        }
 
         if (!writtenFiles.isEmpty()) {
             log.info("Successfully wrote {} Vortex files to {}", writtenFiles.size(), outputPath);
@@ -150,6 +183,40 @@ public final class VortexBatchWrite implements Write, BatchWrite, Serializable {
         } catch (RuntimeException e) {
             log.error("Failed to clean up {} file(s) under {}", filePaths.size(), outputPath, e);
         }
+    }
+
+    /**
+     * Deletes, in every partition directory this job wrote into, the files that this job did not write. Files are
+     * matched by name within their directory because the listing may spell the directory differently from the writer
+     * (for example {@code file://} URIs for a bare path).
+     */
+    private void deleteReplacedPartitionFiles(List<String> writtenFiles) {
+        Map<String, Set<String>> writtenNamesByDirectory = new HashMap<>();
+        for (String file : writtenFiles) {
+            int slash = file.lastIndexOf('/');
+            writtenNamesByDirectory
+                    .computeIfAbsent(file.substring(0, slash), dir -> new HashSet<>())
+                    .add(file.substring(slash + 1));
+        }
+
+        var session = VortexSparkSession.get(options);
+        List<String> replaced = new ArrayList<>();
+        writtenNamesByDirectory.forEach((directory, writtenNames) -> {
+            for (String existing : NativeFiles.listFiles(session, directory, options)) {
+                if (!writtenNames.contains(existing.substring(existing.lastIndexOf('/') + 1))) {
+                    replaced.add(existing);
+                }
+            }
+        });
+        if (replaced.isEmpty()) {
+            return;
+        }
+        log.warn(
+                "Deleting {} previous file(s) from the {} partition(s) replaced under {}",
+                replaced.size(),
+                writtenNamesByDirectory.size(),
+                outputPath);
+        NativeFiles.delete(session, replaced.toArray(new String[0]), options);
     }
 
     private static List<String> extractFilePaths(WriterCommitMessage[] messages) {
