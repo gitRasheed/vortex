@@ -5,6 +5,7 @@ package dev.vortex.spark.write;
 
 import dev.vortex.api.Session;
 import dev.vortex.api.VortexWriter;
+import dev.vortex.jni.NativeFiles;
 import dev.vortex.relocated.org.apache.arrow.c.ArrowArray;
 import dev.vortex.relocated.org.apache.arrow.c.ArrowSchema;
 import dev.vortex.relocated.org.apache.arrow.c.Data;
@@ -30,8 +31,6 @@ import dev.vortex.relocated.org.apache.arrow.vector.complex.MapVector;
 import dev.vortex.relocated.org.apache.arrow.vector.complex.StructVector;
 import dev.vortex.spark.VortexSparkSession;
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.spark.sql.catalyst.InternalRow;
@@ -395,7 +394,9 @@ public final class VortexDataWriter implements DataWriter<InternalRow>, AutoClos
     /**
      * Aborts the write operation and cleans up resources.
      *
-     * <p>This deletes any partially written file.
+     * <p>Closing the native writer finalizes the file with the batches flushed so far, so the file is deleted
+     * afterwards: a retried or speculative attempt of the same task writes its own file, and Spark never reports this
+     * one.
      *
      * @throws IOException if abort fails
      */
@@ -427,16 +428,17 @@ public final class VortexDataWriter implements DataWriter<InternalRow>, AutoClos
                 allocator = null;
             }
 
+            // The path is a URL (file://, s3://) or a plain path, which only the native filesystem
+            // layer that wrote the file resolves; java.nio.file cannot delete a URL string.
+            try {
+                NativeFiles.delete(session, new String[] {filePath}, options.asCaseSensitiveMap());
+            } catch (RuntimeException e) {
+                logger.warn("Failed to delete the file of an aborted write attempt: {}", filePath, e);
+            }
+
             // Session is the JVM-wide singleton held by VortexSparkSession; we just
             // drop our local handle to it here.
             session = null;
-
-            // Delete the partial file if it exists
-            try {
-                Files.deleteIfExists(Paths.get(filePath));
-            } catch (IOException e) {
-                // Ignore - we're already aborting
-            }
 
             closed = true;
         }
