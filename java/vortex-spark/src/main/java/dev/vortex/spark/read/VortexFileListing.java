@@ -6,6 +6,9 @@ package dev.vortex.spark.read;
 import com.google.common.base.Splitter;
 import dev.vortex.api.Session;
 import dev.vortex.jni.NativeFiles;
+import java.io.IOException;
+import java.net.URI;
+import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
@@ -23,6 +26,10 @@ import java.util.stream.Collectors;
  * output, unless the name contains {@code =} (a Hive-style partition directory). Files still being copied
  * ({@code ._COPYING_}) are skipped too. Only path components below the listed root are inspected, so a table may itself
  * live under a hidden directory.
+ *
+ * <p>Empty files are skipped as well ({@code PartitioningAwareFileIndex.isNonEmptyFile}): a writer that died before its
+ * first flush leaves a zero-length file behind, which is not a Vortex file. The native listing reports no sizes, so
+ * only local files are checked.
  */
 public final class VortexFileListing {
     private static final Pattern URI_SCHEME = Pattern.compile("^[A-Za-z][A-Za-z0-9+.-]+:");
@@ -30,7 +37,9 @@ public final class VortexFileListing {
 
     private VortexFileListing() {}
 
-    /** Lists the data files under {@code root}, as URIs, skipping Spark hidden files and directories. */
+    /**
+     * Lists the data files under {@code root}, as URIs, skipping Spark hidden files and directories and empty files.
+     */
     public static List<String> listDataFiles(Session session, String root, Map<String, String> options) {
         int rootDepth = pathSegments(root).size();
         return NativeFiles.listFiles(session, root, options).stream()
@@ -39,11 +48,24 @@ public final class VortexFileListing {
                     return segments.subList(Math.min(rootDepth, segments.size()), segments.size()).stream()
                             .noneMatch(VortexFileListing::isHiddenName);
                 })
+                .filter(uri -> !isEmptyLocalFile(uri))
                 .collect(Collectors.toList());
     }
 
     static boolean isHiddenName(String name) {
         return (name.startsWith("_") && !name.contains("=")) || name.startsWith(".") || name.endsWith("._COPYING_");
+    }
+
+    /** Whether {@code uri} names a local file of zero length. Any other URI, or one that cannot be read, is kept. */
+    private static boolean isEmptyLocalFile(String uri) {
+        if (!uri.startsWith("file:")) {
+            return false;
+        }
+        try {
+            return Files.size(Paths.get(URI.create(uri))) == 0;
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
     }
 
     /**

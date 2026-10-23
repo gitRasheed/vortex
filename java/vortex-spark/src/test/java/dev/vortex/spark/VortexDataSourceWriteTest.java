@@ -556,6 +556,26 @@ public final class VortexDataSourceWriteTest {
         assertEquals(numRows, readDf.count(), "Hidden files must not contribute rows");
     }
 
+    @Test
+    @DisplayName("Reads skip an empty data file, such as a writer that died before its first flush leaves behind")
+    public void testReadSkipsEmptyFiles() throws IOException {
+        int numRows = 100;
+        Dataset<Row> originalDf = createTestDataFrame(numRows);
+        Path outputPath = tempDir.resolve("vortex_with_empty_file");
+        originalDf
+                .repartition(2)
+                .write()
+                .format("vortex")
+                .mode(SaveMode.Overwrite)
+                .save(outputPath.toString());
+        Files.write(outputPath.resolve("part-00002-crashed.vortex"), new byte[0]);
+
+        Dataset<Row> readDf = spark.read().format("vortex").load(outputPath.toString());
+
+        assertSchemaEquals(originalDf.schema(), readDf.schema());
+        assertEquals(numRows, readDf.count(), "An empty file must be skipped, not fail the read");
+    }
+
     /** Creates a test DataFrame with monotonically increasing integers and their string representations. */
     private Dataset<Row> createTestDataFrame(int numRows) {
         // Create DataFrame with monotonically increasing integers
