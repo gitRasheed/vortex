@@ -97,8 +97,14 @@ public final class VortexDataSourceInferSchemaTest {
 
         for (Dataset<Row> read : List.of(
                 spark.read().format("vortex").load(table.toString()),
-                spark.read().format("vortex").load(numeric, text),
-                spark.read().format("vortex").load(text, numeric))) {
+                spark.read()
+                        .format("vortex")
+                        .option("basePath", table.toString())
+                        .load(numeric, text),
+                spark.read()
+                        .format("vortex")
+                        .option("basePath", table.toString())
+                        .load(text, numeric))) {
             assertEquals(DataTypes.StringType, read.schema().apply("p").dataType());
             List<String> values = read.select("p").collectAsList().stream()
                     .map(row -> row.getString(0))
@@ -122,6 +128,19 @@ public final class VortexDataSourceInferSchemaTest {
 
         assertEquals(DataTypes.IntegerType, read.schema().apply("p").dataType());
         assertEquals(7, read.select("p").first().getInt(0));
+    }
+
+    @Test
+    @DisplayName("key=value directories above the table path are not partition columns")
+    public void directoriesAboveTheTableAreNotPartitions() {
+        Path table = tempDir.resolve("region=eu").resolve("dt=2024-01-01").resolve("table");
+        Dataset<Row> rows = spark.sql("SELECT 1L AS id, 'x' AS dt");
+        rows.write().format("vortex").mode(SaveMode.Append).save(table.toString());
+
+        Dataset<Row> read = spark.read().format("vortex").load(table.toString());
+
+        assertEquals(List.of("id", "dt"), List.of(read.schema().fieldNames()));
+        assertEquals(rows.collectAsList(), read.collectAsList());
     }
 
     /** Concatenates the messages of the whole cause chain, since Spark may wrap data source exceptions. */

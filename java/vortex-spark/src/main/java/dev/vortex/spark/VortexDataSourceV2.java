@@ -12,6 +12,7 @@ import dev.vortex.spark.config.HadoopUtils;
 import dev.vortex.spark.read.PartitionPathUtils;
 import dev.vortex.spark.read.VortexBatchExec;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -81,10 +82,10 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
 
         // List each path once: the data schema comes from the first file listed under the last path, the partition
         // columns from every file.
-        List<List<String>> filesPerPath = paths.stream()
-                .map(path -> listVortexFiles(List.of(path), formatOptions))
+        List<Map<String, Map<String, String>>> filesPerPath = paths.stream()
+                .map(path -> resolvePartitionValues(path, formatOptions))
                 .collect(Collectors.toList());
-        List<String> lastPathFiles = Iterables.getLast(filesPerPath);
+        Map<String, Map<String, String>> lastPathFiles = Iterables.getLast(filesPerPath);
         if (lastPathFiles.isEmpty()) {
             throw new IllegalArgumentException(String.format(
                     "Unable to infer schema for %s: no .vortex files found under path %s. "
@@ -92,8 +93,9 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
                             + "or provide an explicit schema.",
                     shortName(), Iterables.getLast(paths)));
         }
-        String pathToInfer = lastPathFiles.get(0);
-        List<String> files = filesPerPath.stream().flatMap(List::stream).collect(Collectors.toList());
+        String pathToInfer = lastPathFiles.keySet().iterator().next();
+        Map<String, Map<String, String>> files = new LinkedHashMap<>();
+        filesPerPath.forEach(files::putAll);
 
         StructType dataSchema;
         {
@@ -147,13 +149,18 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
             return new Transform[0];
         }
         var formatOptions = buildDataSourceOptions(options.asCaseSensitiveMap());
-        return PartitionPathUtils.partitionColumnNames(listVortexFiles(paths, formatOptions)).stream()
+        Map<String, Map<String, String>> files = new LinkedHashMap<>();
+        for (String path : paths) {
+            files.putAll(resolvePartitionValues(path, formatOptions));
+        }
+        return PartitionPathUtils.partitionColumnNames(files).stream()
                 .map(Expressions::identity)
                 .toArray(Transform[]::new);
     }
 
-    private static List<String> listVortexFiles(List<String> paths, Map<String, String> formatOptions) {
-        return VortexBatchExec.resolveVortexPaths(VortexSparkSession.get(formatOptions), paths, formatOptions);
+    private static Map<String, Map<String, String>> resolvePartitionValues(
+            String path, Map<String, String> formatOptions) {
+        return VortexBatchExec.resolvePartitionValues(VortexSparkSession.get(formatOptions), path, formatOptions);
     }
 
     /**

@@ -9,7 +9,7 @@ import dev.vortex.jni.NativeFiles;
 import dev.vortex.spark.VortexFilePartition;
 import dev.vortex.spark.VortexSparkSession;
 import java.util.Arrays;
-import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -29,7 +29,7 @@ public final class VortexBatchExec implements Batch {
     private final StructType readSchema;
     private final Map<String, String> formatOptions;
     private final Predicate[] pushedPredicates;
-    private List<String> resolvedPaths;
+    private List<VortexFilePartition> resolvedPartitions;
 
     /**
      * Creates a new VortexBatchExec for scanning the specified Vortex files.
@@ -52,32 +52,50 @@ public final class VortexBatchExec implements Batch {
      *
      * <p>Directory-like entries are expanded to concrete {@code .vortex} files. Each resolved file becomes its own
      * {@link VortexFilePartition}; the partition carries the paths the reader should open, the requested schema, and
-     * any Hive-style partition values parsed out of the path.
+     * any Hive-style partition values parsed out of the path below its table root.
      */
     @Override
     public InputPartition[] planInputPartitions() {
-        resolvedPaths = resolvePaths();
-        return resolvedPaths.stream()
-                .map(path -> {
-                    Map<String, String> partVals = PartitionPathUtils.parsePartitionValues(path);
-                    return new VortexFilePartition(
-                            List.of(path), readSchema, formatOptions, ImmutableMap.copyOf(partVals));
-                })
-                .toArray(InputPartition[]::new);
+        resolvedPartitions = resolvePartitions();
+        return resolvedPartitions.toArray(InputPartition[]::new);
     }
 
     @Override
     public PartitionReaderFactory createReaderFactory() {
-        List<String> files = resolvedPaths != null ? resolvedPaths : resolvePaths();
-        Set<String> partitionColumns = collectPartitionColumnNames(files);
+        List<VortexFilePartition> files = resolvedPartitions != null ? resolvedPartitions : resolvePartitions();
+        Set<String> partitionColumns = files.stream()
+                .flatMap(file -> file.partitionValues().keySet().stream())
+                .collect(Collectors.toSet());
         List<String> dataColumnNames = Arrays.stream(readSchema.fieldNames())
                 .filter(name -> !partitionColumns.contains(name))
                 .collect(Collectors.toList());
         return new VortexPartitionReaderFactory(dataColumnNames, formatOptions, pushedPredicates);
     }
 
-    private List<String> resolvePaths() {
-        return resolveVortexPaths(VortexSparkSession.get(formatOptions), paths, formatOptions);
+    private List<VortexFilePartition> resolvePartitions() {
+        Session session = VortexSparkSession.get(formatOptions);
+        return paths.stream()
+                .flatMap(path -> resolvePartitionValues(session, path, formatOptions).entrySet().stream())
+                .map(file -> new VortexFilePartition(
+                        List.of(file.getKey()), readSchema, formatOptions, ImmutableMap.copyOf(file.getValue())))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Resolves the files of one path (see {@link #resolveVortexPaths}) and parses each file's Hive-style partition
+     * values below the path's table root, as {@link PartitionPathUtils#tableRoot} chooses it. Shared with schema
+     * inference so that planning and inference agree on the partition columns.
+     *
+     * @return each file's partition values, keyed by its path in listing order
+     */
+    public static Map<String, Map<String, String>> resolvePartitionValues(
+            Session session, String path, Map<String, String> formatOptions) {
+        String tableRoot = PartitionPathUtils.tableRoot(path, formatOptions);
+        Map<String, Map<String, String>> values = new LinkedHashMap<>();
+        for (String file : resolveVortexPaths(session, List.of(path), formatOptions)) {
+            values.put(file, PartitionPathUtils.parsePartitionValues(tableRoot, file));
+        }
+        return values;
     }
 
     /**
@@ -92,13 +110,5 @@ public final class VortexBatchExec implements Batch {
                         ? Stream.of(path)
                         : NativeFiles.listFiles(session, path, formatOptions).stream())
                 .collect(Collectors.toList());
-    }
-
-    private static Set<String> collectPartitionColumnNames(List<String> files) {
-        Set<String> all = new HashSet<>();
-        for (String path : files) {
-            all.addAll(PartitionPathUtils.parsePartitionValues(path).keySet());
-        }
-        return all;
     }
 }

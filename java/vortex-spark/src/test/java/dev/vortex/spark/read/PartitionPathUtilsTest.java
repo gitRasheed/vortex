@@ -5,6 +5,7 @@ package dev.vortex.spark.read;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Arrays;
@@ -29,44 +30,70 @@ final class PartitionPathUtilsTest {
     @Test
     @DisplayName("Parses key=value segments from a Hive-style partition path")
     void parsesKeyValueSegments() {
-        Map<String, String> values =
-                PartitionPathUtils.parsePartitionValues("/data/warehouse/year=2024/month=12/part-0.vortex");
+        Map<String, String> values = PartitionPathUtils.parsePartitionValues(
+                "/data/warehouse", "/data/warehouse/year=2024/month=12/part-0.vortex");
         assertEquals(Map.of("year", "2024", "month", "12"), values);
     }
 
     @Test
     @DisplayName("Preserves the order of partition segments in the path")
     void preservesSegmentOrder() {
-        Map<String, String> values = PartitionPathUtils.parsePartitionValues("/tbl/b=2/a=1/c=3/file.vortex");
+        Map<String, String> values = PartitionPathUtils.parsePartitionValues("/tbl", "/tbl/b=2/a=1/c=3/file.vortex");
         assertEquals(List.of("b", "a", "c"), List.copyOf(values.keySet()));
     }
 
     @Test
     @DisplayName("Ignores segments without key=value shape")
     void ignoresNonPartitionSegments() {
-        Map<String, String> values = PartitionPathUtils.parsePartitionValues("/data/plain/dir/file.vortex");
+        Map<String, String> values = PartitionPathUtils.parsePartitionValues("/data", "/data/plain/dir/file.vortex");
         assertTrue(values.isEmpty());
     }
 
     @Test
     @DisplayName("Ignores segments with an empty key or empty value")
     void ignoresEmptyKeyOrValue() {
-        assertTrue(PartitionPathUtils.parsePartitionValues("/tbl/=v/file").isEmpty());
-        assertTrue(PartitionPathUtils.parsePartitionValues("/tbl/k=/file").isEmpty());
+        assertTrue(
+                PartitionPathUtils.parsePartitionValues("/tbl", "/tbl/=v/file").isEmpty());
+        assertTrue(
+                PartitionPathUtils.parsePartitionValues("/tbl", "/tbl/k=/file").isEmpty());
     }
 
     @Test
     @DisplayName("URL-decodes both keys and values")
     void urlDecodesKeysAndValues() {
-        Map<String, String> values = PartitionPathUtils.parsePartitionValues("/tbl/city=New%20York/file.vortex");
+        Map<String, String> values =
+                PartitionPathUtils.parsePartitionValues("/tbl", "/tbl/city=New%20York/file.vortex");
         assertEquals(Map.of("city", "New York"), values);
     }
 
     @Test
     @DisplayName("Splits on the first '=' so values may contain '='")
     void splitsOnFirstEquals() {
-        Map<String, String> values = PartitionPathUtils.parsePartitionValues("/tbl/k=a=b/file.vortex");
+        Map<String, String> values = PartitionPathUtils.parsePartitionValues("/tbl", "/tbl/k=a=b/file.vortex");
         assertEquals(Map.of("k", "a=b"), values);
+    }
+
+    @Test
+    @DisplayName("Only directories below the table root, and not the file name, are partition levels")
+    void parsesOnlyBelowTheTableRoot() {
+        assertEquals(
+                Map.of("day", "1"),
+                PartitionPathUtils.parsePartitionValues("/w/region=eu/t", "file:///w/region=eu/t/day=1/k=v.vortex"));
+        assertTrue(PartitionPathUtils.parsePartitionValues("/w/region=eu/t", "/w/region=eu/t/k=v.vortex")
+                .isEmpty());
+    }
+
+    // --- tableRoot ---
+
+    @Test
+    @DisplayName("The table root is the path, the parent of a file path, or the basePath option")
+    void tableRootFollowsSparkFileIndex() {
+        assertEquals("/t/p=1", PartitionPathUtils.tableRoot("/t/p=1", Map.of()));
+        assertEquals("/t/p=1", PartitionPathUtils.tableRoot("/t/p=1/a.vortex", Map.of()));
+        assertEquals("/t", PartitionPathUtils.tableRoot("/t/p=1/a.vortex", Map.of("basePath", "/t")));
+        assertEquals("file:///t", PartitionPathUtils.tableRoot("/t/p=1", Map.of("BASEPATH", "file:///t")));
+        assertThrows(
+                IllegalArgumentException.class, () -> PartitionPathUtils.tableRoot("/t/p=1", Map.of("basePath", "/u")));
     }
 
     // --- inferPartitionColumnType ---

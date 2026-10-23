@@ -72,10 +72,13 @@ final class VortexBatchExecTest {
     }
 
     @Test
-    @DisplayName("Hive-style partition values are parsed from each file's own path")
+    @DisplayName("Hive-style partition values are parsed from each file's own path below the basePath option")
     void partitionValuesParsedPerFile() {
-        VortexBatchExec exec = execFor(
-                List.of("/tbl/year=2024/month=01/a.vortex", "/tbl/year=2025/month=02/b.vortex", "/tbl/plain.vortex"));
+        VortexBatchExec exec = new VortexBatchExec(
+                List.of("/tbl/year=2024/month=01/a.vortex", "/tbl/year=2025/month=02/b.vortex", "/tbl/plain.vortex"),
+                COLUMNS,
+                Map.of("basePath", "/tbl"),
+                new Predicate[0]);
 
         InputPartition[] partitions = exec.planInputPartitions();
         assertEquals(3, partitions.length);
@@ -83,6 +86,14 @@ final class VortexBatchExecTest {
         assertEquals(Map.of("year", "2024", "month", "01"), ((VortexFilePartition) partitions[0]).partitionValues());
         assertEquals(Map.of("year", "2025", "month", "02"), ((VortexFilePartition) partitions[1]).partitionValues());
         assertEquals(Map.of(), ((VortexFilePartition) partitions[2]).partitionValues());
+    }
+
+    @Test
+    @DisplayName("Without a basePath, a file path's partition discovery starts at its parent directory")
+    void filePathHasNoPartitionValues() {
+        VortexBatchExec exec = execFor(List.of("/tbl/year=2024/a.vortex"));
+
+        assertEquals(Map.of(), ((VortexFilePartition) exec.planInputPartitions()[0]).partitionValues());
     }
 
     @Test
