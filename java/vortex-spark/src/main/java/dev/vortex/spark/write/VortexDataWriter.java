@@ -3,6 +3,7 @@
 
 package dev.vortex.spark.write;
 
+import com.google.common.base.Utf8;
 import dev.vortex.api.Session;
 import dev.vortex.api.VortexWriter;
 import dev.vortex.relocated.org.apache.arrow.c.ArrowArray;
@@ -183,8 +184,16 @@ public final class VortexDataWriter implements DataWriter<InternalRow>, AutoClos
                     // Set null value
                     vector.setNull(rowIndex);
                 } else {
-                    // Set actual value based on data type
-                    populateVector(vector, dataType, row, fieldIndex, rowIndex);
+                    try {
+                        populateVector(vector, dataType, row, fieldIndex, rowIndex);
+                    } catch (IllegalArgumentException e) {
+                        long taskRow = recordCount - batchRows.size() + rowIndex;
+                        throw new IllegalArgumentException(
+                                String.format(
+                                        "Column '%s' (row %d of this task): %s",
+                                        fields[fieldIndex].name(), taskRow, e.getMessage()),
+                                e);
+                    }
                 }
             }
         }
@@ -222,7 +231,19 @@ public final class VortexDataWriter implements DataWriter<InternalRow>, AutoClos
         } else if (dataType instanceof StringType) {
             UTF8String str = row.getUTF8String(fieldIndex);
             if (str != null) {
-                ((VarCharVector) vector).setSafe(rowIndex, str.getBytes());
+                byte[] bytes = str.getBytes();
+                // Spark strings are arbitrary bytes, but Arrow and Vortex Utf8 columns require valid UTF-8; a file
+                // written with invalid bytes cannot be opened again (its footer statistics fail to decode).
+                if (!Utf8.isWellFormed(bytes)) {
+                    String field = vector.getName().equals(ListVector.DATA_VECTOR_NAME)
+                            ? "a list element"
+                            : "field '" + vector.getName() + "'";
+                    throw new IllegalArgumentException(String.format(
+                            "string value in %s is not valid UTF-8 (length %d); Vortex string columns must be"
+                                    + " valid UTF-8, cast the column to BINARY to store raw bytes",
+                            field, bytes.length));
+                }
+                ((VarCharVector) vector).setSafe(rowIndex, bytes);
             }
         } else if (dataType instanceof BinaryType) {
             byte[] bytes = row.getBinary(fieldIndex);

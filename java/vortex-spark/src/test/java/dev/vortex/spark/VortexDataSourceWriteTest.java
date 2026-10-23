@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -375,6 +376,25 @@ public final class VortexDataSourceWriteTest {
         // Check special characters preserved
         Dataset<Row> specialRows = readDf.filter(readDf.col("id").equalTo(3));
         assertEquals("special!@#$%^&*()", specialRows.first().getString(1));
+    }
+
+    @Test
+    @DisplayName("Reject string values that are not valid UTF-8 instead of writing an unreadable file")
+    public void testRejectsStringsThatAreNotValidUtf8() {
+        // Spark strings are arbitrary bytes, while Arrow and Vortex Utf8 columns require valid UTF-8.
+        Dataset<Row> df = spark.range(3).selectExpr("id", "cast(X'FF' as string) as s");
+        String url = tempDir.resolve("invalid_utf8").toUri().toString();
+
+        Throwable thrown = assertThrows(
+                Throwable.class,
+                () -> df.write().format("vortex").mode(SaveMode.Overwrite).save(url));
+
+        StringBuilder messages = new StringBuilder();
+        for (Throwable t = thrown; t != null; t = t.getCause()) {
+            messages.append(t.getMessage()).append('\n');
+        }
+        String message = messages.toString();
+        assertTrue(message.contains("Column 's'") && message.contains("is not valid UTF-8"), message);
     }
 
     @Test
