@@ -29,10 +29,12 @@ import dev.vortex.relocated.org.apache.arrow.vector.VectorSchemaRoot;
 import dev.vortex.relocated.org.apache.arrow.vector.complex.ListVector;
 import dev.vortex.relocated.org.apache.arrow.vector.complex.MapVector;
 import dev.vortex.relocated.org.apache.arrow.vector.complex.StructVector;
+import dev.vortex.relocated.org.apache.arrow.vector.types.pojo.Schema;
 import dev.vortex.spark.VortexSparkSession;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.SpecializedGetters;
 import org.apache.spark.sql.catalyst.util.ArrayData;
@@ -75,6 +77,21 @@ public final class VortexDataWriter implements DataWriter<InternalRow>, AutoClos
     private static final int MIN_BATCH_SIZE = 1;
     private static final int MAX_BATCH_SIZE = 65536; // 64K rows max per batch
 
+    /**
+     * Opens the native writer of a file. Production writers use {@link #openWriter}; tests substitute a writer that
+     * fails, which {@link VortexWriter} being final does not allow otherwise.
+     */
+    @FunctionalInterface
+    interface WriterOpener {
+        VortexWriter open(
+                Session session,
+                String filePath,
+                Schema arrowSchema,
+                BufferAllocator allocator,
+                Map<String, String> options)
+                throws IOException;
+    }
+
     private final String filePath;
     private final StructType schema;
     private final CaseInsensitiveStringMap options;
@@ -97,6 +114,10 @@ public final class VortexDataWriter implements DataWriter<InternalRow>, AutoClos
      * @param options additional write options
      */
     VortexDataWriter(String filePath, StructType schema, CaseInsensitiveStringMap options) {
+        this(filePath, schema, options, VortexDataWriter::openWriter);
+    }
+
+    VortexDataWriter(String filePath, StructType schema, CaseInsensitiveStringMap options, WriterOpener writerOpener) {
         this.filePath = filePath;
         this.schema = schema;
         this.options = options;
@@ -125,9 +146,8 @@ public final class VortexDataWriter implements DataWriter<InternalRow>, AutoClos
             var arrowSchema = SparkToArrowSchema.convert(schema);
 
             this.session = VortexSparkSession.get(options.asCaseSensitiveMap());
-            this.vortexWriter = VortexWriter.builder(session, filePath, arrowSchema, allocator)
-                    .options(options.asCaseSensitiveMap())
-                    .build();
+            this.vortexWriter =
+                    writerOpener.open(session, filePath, arrowSchema, allocator, options.asCaseSensitiveMap());
             this.vectorSchemaRoot = VectorSchemaRoot.create(arrowSchema, allocator);
 
             logger.debug("Initialized VortexDataWriter for {}", filePath);
@@ -136,6 +156,18 @@ public final class VortexDataWriter implements DataWriter<InternalRow>, AutoClos
             logger.error("Failed to initialize VortexDataWriter for {}", filePath, e);
             throw new RuntimeException("Failed to initialize VortexDataWriter", e);
         }
+    }
+
+    static VortexWriter openWriter(
+            Session session,
+            String filePath,
+            Schema arrowSchema,
+            BufferAllocator allocator,
+            Map<String, String> options)
+            throws IOException {
+        return VortexWriter.builder(session, filePath, arrowSchema, allocator)
+                .options(options)
+                .build();
     }
 
     /**
@@ -307,7 +339,9 @@ public final class VortexDataWriter implements DataWriter<InternalRow>, AutoClos
     /**
      * Commits the write operation and returns a commit message.
      *
-     * <p>This flushes any remaining rows and closes the Vortex writer.
+     * <p>This flushes any remaining rows and closes the Vortex writer. If either fails, the writer stays open: Spark
+     * then calls {@link #abort()}, which closes the native writer and deletes the file, so a footer-less or partial
+     * file never stays in the table.
      *
      * @return a commit message with file information
      * @throws IOException if commit fails
@@ -315,65 +349,21 @@ public final class VortexDataWriter implements DataWriter<InternalRow>, AutoClos
     @Override
     public WriterCommitMessage commit() throws IOException {
         if (!closed) {
-            IOException exception = null;
-
-            try {
-                // Write any remaining rows
-                if (!batchRows.isEmpty()) {
-                    writeBatch();
-                }
-
-                // Finalize the file; the summary carries its physical size
-                if (vortexWriter != null) {
-                    try {
-                        bytesWritten = vortexWriter.finish().fileSize();
-                    } finally {
-                        vortexWriter = null; // Always null out the reference
-                    }
-                }
-            } catch (IOException e) {
-                exception = e;
+            if (!batchRows.isEmpty()) {
+                writeBatch();
             }
 
-            // Clean up Arrow resources - always attempt cleanup even if there was an error
-            try {
-                if (vectorSchemaRoot != null) {
-                    vectorSchemaRoot.close();
-                    vectorSchemaRoot = null;
-                }
-            } catch (Exception e) {
-                if (exception == null) {
-                    exception = new IOException("Failed to close VectorSchemaRoot", e);
-                } else {
-                    exception.addSuppressed(e);
-                }
-            }
+            // Finalize the file; the summary carries its physical size
+            bytesWritten = vortexWriter.finish().fileSize();
+            vortexWriter = null;
 
-            // The Arrow C Data Interface export (Data.exportVectorSchemaRoot) creates structural
-            // allocations from this allocator. When writeBatch passes the ArrowArray to Rust,
-            // FFI_ArrowArray::from_raw() takes ownership and nullifies the release callback on
-            // the Java side. The Rust side calls release asynchronously on its own thread, so
-            // small structural allocations may still be outstanding when the allocator is closed.
-            // These are reclaimed when the allocator is garbage collected.
-            if (allocator != null) {
-                try {
-                    allocator.close();
-                } catch (IllegalStateException e) {
-                    logger.debug("Allocator closed with outstanding FFI allocations: {}", e.getMessage());
-                }
-                allocator = null;
-            }
+            closeArrowResources();
 
             // Session is the JVM-wide singleton held by VortexSparkSession; we just
             // drop our local handle to it here.
             session = null;
 
             closed = true;
-
-            // Throw any exception that occurred during cleanup
-            if (exception != null) {
-                throw exception;
-            }
         }
 
         return new VortexWriterCommitMessage(filePath, recordCount, bytesWritten);
@@ -402,19 +392,7 @@ public final class VortexDataWriter implements DataWriter<InternalRow>, AutoClos
                 }
             }
 
-            if (vectorSchemaRoot != null) {
-                vectorSchemaRoot.close();
-                vectorSchemaRoot = null;
-            }
-
-            if (allocator != null) {
-                try {
-                    allocator.close();
-                } catch (IllegalStateException e) {
-                    logger.debug("Allocator closed with outstanding FFI allocations: {}", e.getMessage());
-                }
-                allocator = null;
-            }
+            closeArrowResources();
 
             // The path is a URL (file://, s3://) or a plain path, which only the native filesystem
             // layer that wrote the file resolves; java.nio.file cannot delete a URL string.
@@ -429,6 +407,28 @@ public final class VortexDataWriter implements DataWriter<InternalRow>, AutoClos
             session = null;
 
             closed = true;
+        }
+    }
+
+    private void closeArrowResources() {
+        if (vectorSchemaRoot != null) {
+            vectorSchemaRoot.close();
+            vectorSchemaRoot = null;
+        }
+
+        // The Arrow C Data Interface export (Data.exportVectorSchemaRoot) creates structural
+        // allocations from this allocator. When writeBatch passes the ArrowArray to Rust,
+        // FFI_ArrowArray::from_raw() takes ownership and nullifies the release callback on
+        // the Java side. The Rust side calls release asynchronously on its own thread, so
+        // small structural allocations may still be outstanding when the allocator is closed.
+        // These are reclaimed when the allocator is garbage collected.
+        if (allocator != null) {
+            try {
+                allocator.close();
+            } catch (IllegalStateException e) {
+                logger.debug("Allocator closed with outstanding FFI allocations: {}", e.getMessage());
+            }
+            allocator = null;
         }
     }
 

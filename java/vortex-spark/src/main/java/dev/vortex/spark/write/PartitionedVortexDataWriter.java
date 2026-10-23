@@ -5,6 +5,8 @@ package dev.vortex.spark.write;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.primitives.ImmutableIntArray;
+import dev.vortex.jni.NativeFiles;
+import dev.vortex.spark.VortexSparkSession;
 import java.io.IOException;
 import java.io.Serializable;
 import java.net.URLEncoder;
@@ -69,6 +71,7 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
     private final ResolvedTransform[] resolvedTransforms;
     private final int partitionId;
     private final long taskId;
+    private final VortexDataWriter.WriterOpener writerOpener;
 
     private final Map<String, VortexDataWriter> writers = new HashMap<>();
     private boolean closed = false;
@@ -90,11 +93,23 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
             ResolvedTransform[] resolvedTransforms,
             int partitionId,
             long taskId) {
+        this(baseOutputUri, schema, options, resolvedTransforms, partitionId, taskId, VortexDataWriter::openWriter);
+    }
+
+    PartitionedVortexDataWriter(
+            String baseOutputUri,
+            StructType schema,
+            CaseInsensitiveStringMap options,
+            ResolvedTransform[] resolvedTransforms,
+            int partitionId,
+            long taskId,
+            VortexDataWriter.WriterOpener writerOpener) {
         this.baseOutputUri = baseOutputUri.endsWith("/") ? baseOutputUri : baseOutputUri + "/";
         this.options = options;
         this.partitionId = partitionId;
         this.taskId = taskId;
         this.resolvedTransforms = resolvedTransforms;
+        this.writerOpener = writerOpener;
 
         // Compute the data schema by removing identity partition columns.
         // Only identity transforms correspond to columns that should be stripped from the data,
@@ -144,31 +159,36 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
         }
 
         List<VortexWriterCommitMessage> messages = new ArrayList<>();
-        IOException firstException = null;
-
-        for (Map.Entry<String, VortexDataWriter> entry : writers.entrySet()) {
+        for (VortexDataWriter writer : writers.values()) {
             try {
-                WriterCommitMessage msg = entry.getValue().commit();
-                if (msg instanceof VortexWriterCommitMessage) {
-                    messages.add((VortexWriterCommitMessage) msg);
-                }
-            } catch (IOException e) {
-                if (firstException == null) {
-                    firstException = e;
-                } else {
-                    firstException.addSuppressed(e);
-                }
+                messages.add((VortexWriterCommitMessage) writer.commit());
+            } catch (IOException | RuntimeException e) {
+                // The task fails without Spark ever learning of the files committed so far, so delete
+                // them or the retried attempt duplicates their rows. Spark then calls abort(), which
+                // handles the writers still open: the one that failed and those not reached.
+                deleteCommittedFiles(messages, e);
+                throw e;
             }
         }
-
         closed = true;
-
-        if (firstException != null) {
-            throw firstException;
-        }
 
         logger.info("Committed {} partition writers", messages.size());
         return new PartitionedWriterCommitMessage(messages);
+    }
+
+    private void deleteCommittedFiles(List<VortexWriterCommitMessage> committed, Exception cause) {
+        if (committed.isEmpty()) {
+            return;
+        }
+        String[] filePaths =
+                committed.stream().map(VortexWriterCommitMessage::filePath).toArray(String[]::new);
+        try {
+            NativeFiles.delete(
+                    VortexSparkSession.get(options.asCaseSensitiveMap()), filePaths, options.asCaseSensitiveMap());
+        } catch (RuntimeException e) {
+            logger.warn("Failed to delete the files of a failed task attempt: {}", Arrays.toString(filePaths), e);
+            cause.addSuppressed(e);
+        }
     }
 
     @Override
@@ -203,7 +223,7 @@ public final class PartitionedVortexDataWriter implements DataWriter<InternalRow
         String fileName = String.format("part-%05d-%d.vortex", partitionId, taskId);
         String fileUri = baseOutputUri + partitionPath + "/" + fileName;
         logger.debug("Creating writer for partition path: {}", fileUri);
-        return new VortexDataWriter(fileUri, dataSchema, options);
+        return new VortexDataWriter(fileUri, dataSchema, options, writerOpener);
     }
 
     private String getPartitionPath(InternalRow row) {
