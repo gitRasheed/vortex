@@ -30,6 +30,7 @@ use crate::scalar_fn::ReduceNode;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
 use crate::scalar_fn::ScalarFnVTableExt;
+use crate::scalar_fn::fns::cast::Cast;
 use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::operators::CompareOperator;
 use crate::scalar_fn::fns::operators::Operator;
@@ -74,12 +75,32 @@ const KLEENE_LUT: [[[bool; 2]; 2]; 2] = [
     [[false, false], [false, true]], // and
 ];
 
-/// Kleene and/or reduction where one argument is constant non-NULL and other
-/// is non-constant.
-fn kleene_one_const<T: ReduceNode>(node: T, constant: bool, is_and: bool) -> T {
+/// Kleene and/or reduction where one argument is constant non-NULL and the other is
+/// non-constant.
+///
+/// The reduction must keep the dtype of the `and`/`or` node: the annihilator constant takes the
+/// node's `nullability`, and an identity child that is less nullable than the node is widened
+/// with a cast. The cast is a different node kind, so this rule does not fire on it again.
+fn kleene_one_const<T: ReduceNode>(
+    child: T,
+    constant: bool,
+    is_and: bool,
+    nullability: Nullability,
+) -> VortexResult<T> {
     match (is_and, constant) {
-        (true, true) | (false, false) => node,
-        (is_and, constant) => node.new_constant((constant && !is_and).into()),
+        (true, true) | (false, false) => {
+            if child.node_dtype()?.nullability() == nullability {
+                Ok(child)
+            } else {
+                child.new_node(
+                    Cast.bind(DType::Bool(nullability)),
+                    std::slice::from_ref(&child),
+                )
+            }
+        }
+        (is_and, constant) => {
+            Ok(child.new_constant(Scalar::bool(constant && !is_and, nullability)))
+        }
     }
 }
 
@@ -293,14 +314,18 @@ impl ScalarFnVTable for Binary {
             .and_then(|s| s.value().cloned())
             .map(|v| v.as_bool());
         let is_and = *operator == Operator::And;
+        // A reduction must not change the node's dtype, which can be more nullable than either
+        // folded constant or the surviving child.
+        let nullability = node.node_dtype()?.nullability();
 
         Ok(Some(match (left_const, right_const) {
             (None, None) => return Ok(None),
-            (Some(left_const), Some(right_const)) => left.new_constant(
-                KLEENE_LUT[is_and as usize][left_const as usize][right_const as usize].into(),
-            ),
-            (Some(constant), None) => kleene_one_const(right, constant, is_and),
-            (None, Some(constant)) => kleene_one_const(left, constant, is_and),
+            (Some(left_const), Some(right_const)) => node.new_constant(Scalar::bool(
+                KLEENE_LUT[is_and as usize][left_const as usize][right_const as usize],
+                nullability,
+            )),
+            (Some(constant), None) => kleene_one_const(right, constant, is_and, nullability)?,
+            (None, Some(constant)) => kleene_one_const(left, constant, is_and, nullability)?,
         }))
     }
 
@@ -326,6 +351,7 @@ impl ScalarFnVTable for Binary {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
     use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
 
@@ -632,6 +658,7 @@ mod tests {
         Ok(())
     }
 
+    /// `true? AND x` reduces to `x`, widened to the node's nullable dtype.
     #[test]
     fn test_and_reduce_nullable() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
@@ -639,10 +666,46 @@ mod tests {
             ConstantArray::new(Scalar::bool(true, Nullability::Nullable), 3).into_array();
         let right = BoolArray::from_iter([true, false, true]).into_array();
 
-        let array = Binary::try_new(nullable_true, right.clone(), Operator::And)?
+        let array = Binary::try_new(nullable_true, right, Operator::And)?
             .into_array()
             .optimize()?;
-        assert_arrays_eq!(array, right, &mut ctx);
+        assert_eq!(array.dtype(), &DType::Bool(Nullability::Nullable));
+        assert_arrays_eq!(
+            array,
+            BoolArray::from_iter([Some(true), Some(false), Some(true)]),
+            &mut ctx
+        );
+        Ok(())
+    }
+
+    /// Folding a non-nullable constant into a nullable `and`/`or` node must keep the node's
+    /// `bool?` dtype, both for the annihilator constant and for the surviving identity child.
+    #[rstest]
+    #[case::false_and(Operator::And, false, [Some(false), Some(false), Some(false)])]
+    #[case::true_or(Operator::Or, true, [Some(true), Some(true), Some(true)])]
+    #[case::true_and(Operator::And, true, [Some(true), None, Some(false)])]
+    #[case::false_or(Operator::Or, false, [Some(true), None, Some(false)])]
+    fn reduce_keeps_node_nullability(
+        #[case] operator: Operator,
+        #[case] constant: bool,
+        #[case] expected: [Option<bool>; 3],
+    ) -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let column = BoolArray::from_iter([Some(true), None, Some(false)]).into_array();
+        let constant = ConstantArray::new(constant, 3).into_array();
+        let expected = BoolArray::from_iter(expected);
+
+        for (lhs, rhs) in [(column.clone(), constant.clone()), (constant, column)] {
+            let array = Binary::try_new(lhs, rhs, operator)?
+                .into_array()
+                .optimize()?;
+            assert_eq!(
+                array.dtype(),
+                &DType::Bool(Nullability::Nullable),
+                "{operator}"
+            );
+            assert_arrays_eq!(array, expected, &mut ctx);
+        }
         Ok(())
     }
 
