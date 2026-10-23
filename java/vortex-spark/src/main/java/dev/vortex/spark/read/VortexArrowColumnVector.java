@@ -24,6 +24,7 @@ import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.Decimal;
 import org.apache.spark.sql.types.MapType;
+import org.apache.spark.sql.types.StringType;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.vectorized.ColumnVector;
@@ -381,6 +382,9 @@ public class VortexArrowColumnVector extends ColumnVector {
             compatible = actual instanceof ArrayType;
         } else if (declared instanceof MapType) {
             compatible = actual instanceof MapType;
+        } else if (declared instanceof StringType) {
+            // A collation (Spark 4) only changes how Spark compares the strings, not how the file stores them.
+            compatible = actual instanceof StringType;
         } else {
             compatible = actual.equals(declared);
         }
