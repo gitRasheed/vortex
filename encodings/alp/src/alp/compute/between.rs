@@ -7,6 +7,7 @@ use num_traits::Bounded;
 use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::IntoArray;
+use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::NativeDType;
@@ -17,6 +18,7 @@ use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::between::BetweenOptions;
 use vortex_array::scalar_fn::fns::between::BetweenReduce;
 use vortex_array::scalar_fn::fns::between::StrictComparison;
+use vortex_buffer::BitBuffer;
 use vortex_error::VortexResult;
 
 use crate::ALP;
@@ -78,14 +80,14 @@ where
     let Some((lower_enc, lower_strict)) =
         encode_lower_bound::<T>(lower, exponents, options.lower_strict)
     else {
-        return Ok(ConstantArray::new(Scalar::bool(false, nullability), array.len()).into_array());
+        return all_false(array, nullability);
     };
 
     // the upper value `x { < | <= } value` similarly encodes or `x < value < enc_above(value())`
     let Some((upper_enc, upper_strict)) =
         encode_upper_bound::<T>(upper, exponents, options.upper_strict)
     else {
-        return Ok(ConstantArray::new(Scalar::bool(false, nullability), array.len()).into_array());
+        return all_false(array, nullability);
     };
 
     let options = BetweenOptions {
@@ -98,6 +100,12 @@ where
         ConstantArray::new(Scalar::primitive(upper_enc, nullability), array.len()).into_array(),
         options,
     )
+}
+
+/// No value can satisfy the bounds, but null rows stay null: `not(between)` must not select them.
+fn all_false(array: ArrayView<'_, ALP>, nullability: Nullability) -> VortexResult<ArrayRef> {
+    let validity = array.validity()?.union_nullability(nullability);
+    Ok(BoolArray::new(BitBuffer::new_unset(array.len()), validity).into_array())
 }
 
 fn encode_lower_bound<T: ALPFloat + NativePType>(
@@ -138,8 +146,10 @@ fn encode_upper_bound<T: ALPFloat + NativePType>(
 mod tests {
     use std::sync::LazyLock;
 
+    use rstest::rstest;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::ConstantArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
@@ -238,6 +248,36 @@ mod tests {
                 upper_strict: StrictComparison::Strict,
             },
             true,
+        );
+    }
+
+    /// A bound that cannot encode makes every row false, but the array's nulls stay null.
+    #[rstest]
+    #[case::lower_inf(f64::INFINITY, 10.0)]
+    #[case::lower_nan(f64::NAN, 10.0)]
+    #[case::upper_neg_inf(-10.0, f64::NEG_INFINITY)]
+    fn non_encodable_bound_keeps_validity(#[case] lower: f64, #[case] upper: f64) {
+        let mut ctx = SESSION.create_execution_ctx();
+        let array = PrimitiveArray::from_option_iter([Some(1.5f64), None, Some(2.25), None]);
+        let encoded = alp_encode(array.as_view(), None, &mut ctx).unwrap();
+        assert!(encoded.patches().is_none());
+
+        let options = BetweenOptions {
+            lower_strict: StrictComparison::NonStrict,
+            upper_strict: StrictComparison::NonStrict,
+        };
+        let result = between_impl(
+            encoded.as_view(),
+            lower,
+            upper,
+            Nullability::Nullable,
+            &options,
+        )
+        .unwrap();
+        assert_arrays_eq!(
+            result,
+            BoolArray::from_iter([Some(false), None, Some(false), None]),
+            &mut ctx
         );
     }
 
