@@ -4,6 +4,7 @@
 package dev.vortex.spark;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -120,6 +121,21 @@ public final class VortexNestedSchemaPruningTest {
             expected.add(RowFactory.create(300 + id, 100 + id, null, 300 + id));
         }
         assertEquals(expected, rows);
+    }
+
+    @Test
+    @DisplayName("A collated string in the read schema reads a string field")
+    public void readSchemaWithCollatedString() {
+        assumeTrue(spark.version().startsWith("4."), "collations exist from Spark 4");
+        List<Row> rows = spark.read()
+                .format("vortex")
+                .schema("id bigint, outer struct<p: string collate utf8_lcase>")
+                .load(path)
+                .selectExpr("outer.p")
+                .collectAsList();
+        assertEquals(
+                List.of("x", "x", "x", "x", "x"),
+                rows.stream().map(row -> row.getString(0)).toList());
     }
 
     private List<Long> longsOf(Column column) {
