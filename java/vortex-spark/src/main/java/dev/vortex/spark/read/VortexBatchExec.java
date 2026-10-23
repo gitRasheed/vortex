@@ -82,13 +82,17 @@ public final class VortexBatchExec implements Batch {
     /**
      * Expands directory-like entries to the data files beneath them, skipping Spark hidden files such as
      * {@code _SUCCESS} (see {@link VortexFileListing}); entries that already name a {@code .vortex} file are kept
-     * as-is. Shared with {@link VortexScan#estimateStatistics()} so planning and execution resolve paths identically.
+     * as-is. A file reached through several entries, such as a table path given twice or spelled two ways, is returned
+     * once, as Spark's own file index reads each leaf file once. Shared with {@link VortexScan#estimateStatistics()} so
+     * planning and execution resolve paths identically.
      */
     static List<String> resolveVortexPaths(Session session, List<String> paths, Map<String, String> formatOptions) {
         return paths.stream()
+                .distinct()
                 .flatMap(path -> path.endsWith(".vortex")
                         ? Stream.of(path)
                         : VortexFileListing.listDataFiles(session, path, formatOptions).stream())
+                .distinct()
                 .collect(Collectors.toList());
     }
 

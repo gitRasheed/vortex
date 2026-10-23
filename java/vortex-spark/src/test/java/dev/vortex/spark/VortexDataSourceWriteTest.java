@@ -556,6 +556,27 @@ public final class VortexDataSourceWriteTest {
         assertEquals(numRows, readDf.count(), "Hidden files must not contribute rows");
     }
 
+    @Test
+    @DisplayName("A file reached through several load paths is read once")
+    public void testDuplicateLoadPathsReadEachFileOnce() {
+        int numRows = 100;
+        Path outputPath = tempDir.resolve("vortex_duplicate_paths");
+        createTestDataFrame(numRows)
+                .selectExpr("*", "id % 2 as part")
+                .write()
+                .format("vortex")
+                .mode(SaveMode.Overwrite)
+                .partitionBy("part")
+                .save(outputPath.toString());
+
+        // The same table as a bare path and as a file URI: Spark's file index would list every file once.
+        Dataset<Row> readDf = spark.read()
+                .format("vortex")
+                .load(outputPath.toString(), outputPath.toUri().toString());
+
+        assertEquals(numRows, readDf.count(), "A file named by several load paths must contribute its rows once");
+    }
+
     /** Creates a test DataFrame with monotonically increasing integers and their string representations. */
     private Dataset<Row> createTestDataFrame(int numRows) {
         // Create DataFrame with monotonically increasing integers
