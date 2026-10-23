@@ -529,6 +529,31 @@ public final class VortexDataSourceWriteTest {
                 nestedRows.stream().map(row -> row.getLong(1)).toList());
     }
 
+    @Test
+    @DisplayName("A column some files declare non-null still reads the nulls of the other files")
+    public void testSchemaInferredFromNonNullFileReadsNulls() {
+        Path nonNull = tempDir.resolve("vortex_non_null");
+        Path withNulls = tempDir.resolve("vortex_with_nulls");
+        spark.range(5)
+                .selectExpr("cast(id as int) as v")
+                .write()
+                .format("vortex")
+                .mode(SaveMode.Overwrite)
+                .save(nonNull.toString());
+        spark.range(5)
+                .selectExpr("if(id % 2 = 0, cast(id as int), null) as v")
+                .write()
+                .format("vortex")
+                .mode(SaveMode.Overwrite)
+                .save(withNulls.toString());
+
+        // The schema is inferred from the last path, whose file declares `v` non-null.
+        Dataset<Row> readDf = spark.read().format("vortex").load(withNulls.toString(), nonNull.toString());
+
+        assertTrue(readDf.schema().apply("v").nullable(), "The table schema must be nullable");
+        assertEquals(2, readDf.filter("v is null").count(), "The nulls of the nullable file must be read");
+    }
+
     /** Creates a test DataFrame with monotonically increasing integers and their string representations. */
     private Dataset<Row> createTestDataFrame(int numRows) {
         // Create DataFrame with monotonically increasing integers
@@ -567,8 +592,12 @@ public final class VortexDataSourceWriteTest {
         }
     }
 
-    /** Verifies that two schemas are equal. */
-    private void assertSchemaEquals(StructType expected, StructType actual) {
+    /**
+     * Verifies that a schema read back matches the written one. Like Spark's own file sources, a Vortex table's schema
+     * is nullable throughout, whatever the nullability of the DataFrame that wrote it.
+     */
+    private void assertSchemaEquals(StructType written, StructType actual) {
+        StructType expected = written.asNullable();
         assertEquals(expected.fields().length, actual.fields().length, "Schemas should have same number of fields");
 
         for (int i = 0; i < expected.fields().length; i++) {

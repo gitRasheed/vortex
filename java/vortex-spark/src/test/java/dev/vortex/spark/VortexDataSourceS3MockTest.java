@@ -137,8 +137,12 @@ public final class VortexDataSourceS3MockTest {
                         "array('Alpha', 'Bravo', 'Charlie') AS elements");
     }
 
-    /** Verifies that two schemas are equal. */
-    private void assertSchemaEquals(StructType expected, StructType actual) {
+    /**
+     * Verifies that a schema read back matches the written one. Like Spark's own file sources, a Vortex table's schema
+     * is nullable throughout, whatever the nullability of the DataFrame that wrote it.
+     */
+    private void assertSchemaEquals(StructType written, StructType actual) {
+        StructType expected = written.asNullable();
         assertEquals(expected.fields().length, actual.fields().length, "Schemas should have same number of fields");
 
         for (int i = 0; i < expected.fields().length; i++) {

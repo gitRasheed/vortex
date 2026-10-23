@@ -377,8 +377,9 @@ public final class VortexFilterPushdownTest {
         QueryExecution qe = filtered.queryExecution();
         SparkPlan plan = qe.executedPlan();
         String planString = plan.toString();
+        // The table schema is nullable, so Spark pushes `id IS NOT NULL` alongside, as it does for Parquet.
         assertTrue(
-                planString.contains("pushedPredicates=[id > 1]"),
+                planString.matches("(?s).*pushedPredicates=\\[[^\\]]*id > 1[^\\]]*\\].*"),
                 "Expected pushed predicate for id > 1 in the executed plan: " + planString);
     }
 

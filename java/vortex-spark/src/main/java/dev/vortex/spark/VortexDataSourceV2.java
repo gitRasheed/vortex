@@ -170,7 +170,11 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
      * the table's warehouse location. The returned table then has no paths; once the table is loaded for reads or
      * writes, Spark always supplies the resolved table location as the {@code path} property.
      *
-     * @param schema the table schema
+     * <p>The table schema is nullable throughout, as for Spark's own file sources: the files of a table need not agree
+     * on nullability, and Spark would read a declared non-null column without null checks. Writes use the schema of the
+     * written DataFrame, so a non-null column is still stored as such.
+     *
+     * @param schema the table schema, inferred or supplied by the user or a catalog
      * @param partitioning table partitioning transforms
      * @param properties the table properties containing file paths and other options
      * @return a VortexTable instance for reading and writing data
@@ -179,7 +183,7 @@ public final class VortexDataSourceV2 implements TableProvider, DataSourceRegist
     public Table getTable(StructType schema, Transform[] partitioning, Map<String, String> properties) {
         var uncased = new CaseInsensitiveStringMap(properties);
         ImmutableList<String> paths = getPathsOrEmpty(uncased);
-        return new VortexTable(paths, schema, buildDataSourceOptions(properties), partitioning);
+        return new VortexTable(paths, schema.asNullable(), buildDataSourceOptions(properties), partitioning);
     }
 
     /**
