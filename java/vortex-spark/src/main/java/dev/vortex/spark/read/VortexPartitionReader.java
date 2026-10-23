@@ -69,7 +69,8 @@ final class VortexPartitionReader implements PartitionReader<ColumnarBatch> {
 
         // Always project, even with no columns: a scan without a projection reads every column,
         // whereas an empty select only counts rows, which is all count(*) needs.
-        var options = ScanOptions.builder().projection(Expression.select(binding.presentFileNames(), Expression.root()));
+        var options =
+                ScanOptions.builder().projection(Expression.select(binding.presentFileNames(), Expression.root()));
         if (pushedPredicates != null && pushedPredicates.length > 0) {
             buildFilterExpression(pushedPredicates, binding).ifPresent(options::filter);
         }

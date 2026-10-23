@@ -107,8 +107,8 @@ public final class VortexBatchExec implements Batch {
     /**
      * Expands directory-like entries to the data files beneath them, skipping Spark hidden files such as
      * {@code _SUCCESS} (see {@link VortexFileListing}); entries that already name a {@code .vortex} file are kept
-     * as-is. Shared with {@link VortexScan#estimateStatistics()} and schema inference so planning and execution
-     * resolve paths identically.
+     * as-is. Shared with {@link VortexScan#estimateStatistics()} and schema inference so planning and execution resolve
+     * paths identically.
      */
     public static List<String> resolveVortexPaths(
             Session session, List<String> paths, Map<String, String> formatOptions) {
