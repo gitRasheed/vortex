@@ -52,7 +52,8 @@ impl CompareKernel for DateTimeParts {
         let Some(options) = ext_dtype.metadata_opt::<Timestamp>() else {
             return Ok(None);
         };
-        // The constant has no i32 days part.
+
+        // Fall back to the full timestamp comparison if the literal's days do not fit `i32`.
         let Ok(ts_parts) = timestamp::split(timestamp, options.unit) else {
             return Ok(None);
         };

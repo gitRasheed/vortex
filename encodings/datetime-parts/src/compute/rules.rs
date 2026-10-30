@@ -135,9 +135,11 @@ impl ArrayParentReduceRule<DateTimeParts> for DTPComparisonPushDownRule {
                     return Ok(None);
                 };
                 let len = days.len();
+
                 // Keep the nullability of the replaced constant, so the rewritten comparison has
                 // the same result dtype as the original.
                 let target_dtype = days.dtype().with_nullability(c.dtype().nullability());
+
                 // Narrowed days, such as u16, cannot hold every literal's days.
                 let Ok(days_scalar) = Scalar::from(days_value).cast(&target_dtype) else {
                     return Ok(None);
@@ -283,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn days_pushdown_declines_constant_outside_i32_days() {
+    fn test_days_pushdown_declines_constant_outside_i32_days() {
         let constant = midnight_constant(i64::from(i32::MAX) + 1, TimeUnit::Seconds, 1);
         assert_eq!(try_extract_days_constant(&constant), None);
     }
@@ -294,7 +296,10 @@ mod tests {
     #[case::eq(Operator::Eq, false)]
     #[case::not_eq(Operator::NotEq, true)]
     #[case::gt(Operator::Gt, false)]
-    fn test_midnight_comparison_beyond_narrowed_days(#[case] op: Operator, #[case] expected: bool) {
+    fn test_midnight_comparison_beyond_narrowed_days(
+        #[case] op: Operator,
+        #[case] expected: bool,
+    ) -> VortexResult<()> {
         let dtype = dtp_at_midnight(&[0], TimeUnit::Microseconds)
             .dtype()
             .clone();
@@ -303,19 +308,20 @@ mod tests {
             PrimitiveArray::from_iter([20_000u16, 20_001]).into_array(),
             ConstantArray::new(0u8, 2).into_array(),
             ConstantArray::new(0u8, 2).into_array(),
-        )
-        .unwrap();
+        )?;
+
+        // Midnight on 9999-12-31 UTC, beyond the narrowed days child's range.
         let constant = midnight_constant(2_932_896, TimeUnit::Microseconds, 2);
-        let comparison = Binary::try_new(narrowed.into_array(), constant, op)
-            .unwrap()
-            .into_array();
+        let comparison = Binary::try_new(narrowed.into_array(), constant, op)?.into_array();
 
         let mut ctx = SESSION.create_execution_ctx();
         assert_arrays_eq!(
-            comparison.optimize().unwrap(),
+            comparison.optimize()?,
             BoolArray::from_iter([expected, expected]),
             &mut ctx
         );
+
+        Ok(())
     }
 
     #[test]

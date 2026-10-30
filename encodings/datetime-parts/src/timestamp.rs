@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+//! Splits and combines individual timestamp counts.
+//!
+//! Each part uses `i32`. The checked split rejects timestamps whose days would wrap, while the
+//! array kernels check their days in bulk.
+
 use num_traits::AsPrimitive;
 use vortex_array::extension::datetime::TimeUnit;
 use vortex_error::VortexResult;
@@ -9,15 +14,13 @@ use vortex_error::vortex_panic;
 
 pub const SECONDS_PER_DAY: i64 = 86_400; // 24 * 60 * 60
 
-/// Parts of a Unix timestamp (time since 1970-01-01 00:00:00 UTC).
-///
-/// Broken down into:
-///  * Days since epoch (must fit `i32`, see [`days_fit`])
-///  * Seconds within day (0-86399)
-///  * Subseconds (range depends on `TimeUnit`)
+/// Components of a Unix timestamp relative to 1970-01-01 00:00:00 UTC.
 pub struct TimestampParts {
+    /// Days since the Unix epoch.
     pub days: i32,
+    /// Seconds within the day, with magnitude less than [`SECONDS_PER_DAY`].
     pub seconds: i32,
+    /// Subseconds within the second, in the units of the original timestamp.
     pub subseconds: i32,
 }
 
@@ -25,8 +28,8 @@ pub struct TimestampParts {
 ///
 /// # Arguments
 ///
-/// * `timestamp` - Number of time units since the Unix epoch
-/// * `time_unit` - Precision of the timestamp (ns, μs, ms, or s)
+/// * `timestamp` - Number of time units since the Unix epoch.
+/// * `time_unit` - Precision of the timestamp (ns, μs, ms, or s).
 ///
 /// # Errors
 ///
@@ -39,12 +42,14 @@ pub fn split(timestamp: i64, time_unit: TimeUnit) -> VortexResult<TimestampParts
         TimeUnit::Seconds => split_with_divisor::<1>(timestamp),
         TimeUnit::Days => vortex_bail!("Cannot handle day-level data"),
     };
+
     if !days_fit(timestamp, time_unit) {
         vortex_bail!(
             "Timestamp {timestamp}{time_unit} lies more than i32::MAX days from the epoch and \
              cannot be split into days"
         );
     }
+
     Ok(parts)
 }
 
@@ -57,12 +62,14 @@ pub fn days_fit(timestamp: i64, time_unit: TimeUnit) -> bool {
         TimeUnit::Seconds => 1,
         TimeUnit::Days => return false,
     };
+
     i32::try_from(timestamp / (SECONDS_PER_DAY * ticks_per_second)).is_ok()
 }
 
 /// Split a Unix timestamp into parts using a constant DIVISOR.
 ///
-/// Days that do not fit `i32` wrap, so callers check [`days_fit`] first.
+/// Days outside `i32` wrap. Callers must reject an out-of-range result before using it, or the
+/// timestamp will be reconstructed incorrectly.
 #[inline]
 pub(crate) fn split_with_divisor<const DIVISOR: i64>(timestamp: i64) -> TimestampParts {
     let days = timestamp / (SECONDS_PER_DAY * DIVISOR);
@@ -187,14 +194,24 @@ mod tests {
     #[case::milliseconds(TimeUnit::Milliseconds, false)]
     #[case::microseconds(TimeUnit::Microseconds, true)]
     #[case::nanoseconds(TimeUnit::Nanoseconds, true)]
-    fn split_rejects_days_outside_i32(#[case] unit: TimeUnit, #[case] fits: bool) {
+    fn test_split_rejects_days_outside_i32(
+        #[case] unit: TimeUnit,
+        #[case] fits: bool,
+    ) -> VortexResult<()> {
         for ts in [i64::MAX, i64::MIN] {
             assert_eq!(days_fit(ts, unit), fits, "{ts}{unit}");
-            match split(ts, unit) {
-                Ok(parts) => assert_eq!(combine(parts, unit), ts, "{ts}{unit}"),
-                Err(err) => assert!(!fits && err.to_string().contains("i32::MAX days"), "{err}"),
+            let result = split(ts, unit);
+            if fits {
+                assert_eq!(combine(result?, unit), ts, "{ts}{unit}");
+            } else {
+                let Err(err) = result else {
+                    vortex_panic!("storage extreme exceeds i32 days for {unit}");
+                };
+                assert!(err.to_string().contains("i32::MAX days"), "{err}");
             }
         }
+
+        Ok(())
     }
 
     #[test]

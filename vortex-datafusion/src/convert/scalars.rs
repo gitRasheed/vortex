@@ -426,6 +426,7 @@ mod tests {
     fn test_accept_extreme_timestamp_scalar() -> VortexResult<()> {
         let expected = ScalarValue::TimestampSecond(Some(i64::MAX), None);
         let scalar = scalar_from_df(&expected, &VortexSession::default())?;
+
         assert_eq!(scalar.try_to_df()?, expected);
 
         Ok(())

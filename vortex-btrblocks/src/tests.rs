@@ -130,6 +130,7 @@ fn test_extreme_second_timestamps_roundtrip() -> VortexResult<()> {
     .into_array();
     let compressed = assert_roundtrip(&compressor, &input)?;
     assert!(!compressed.is::<DateTimeParts>());
+
     Ok(())
 }
 

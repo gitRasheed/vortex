@@ -71,9 +71,10 @@ impl Scheme for TemporalScheme {
         _compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> CompressionEstimate {
-        // Second and millisecond timestamps past i32::MAX days cannot be split.
+        // DateTimeParts cannot represent timestamps whose days do not fit `i32`.
         let splittable = TemporalArray::try_from(data.array().clone())
             .and_then(|temporal| can_split_temporal(&temporal, exec_ctx));
+
         match splittable {
             Ok(true) => CompressionEstimate::Verdict(EstimateVerdict::AlwaysUse),
             _ => CompressionEstimate::Verdict(EstimateVerdict::Skip),
