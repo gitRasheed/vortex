@@ -242,17 +242,23 @@ jobs:
             -o sizes.json
           cat sizes.json >> results.json
 
+      - name: Fetch baseline from the benchmarks database
+        if: inputs.mode == 'pr'
+        uses: ./.github/actions/fetch-bench-baseline
+        with:
+          role-arn: ${{ vars.GH_BENCH_READ_ROLE_ARN }}
+          region: ${{ vars.RDS_BENCH_REGION }}
+          endpoint: ${{ vars.RDS_BENCH_INSTANCE_ENDPOINT }}
+          database: ${{ vars.RDS_BENCH_DB_NAME }}
+
       - name: Compare results
         if: inputs.mode == 'pr'
         shell: bash
         run: |
           set -Eeu -o pipefail -x
 
-          python3 scripts/s3-download.py s3://vortex-ci-benchmark-results/data.json.gz data.json.gz --no-sign-request
-          gzip -d -c data.json.gz > base.json
-
-          uv run --no-project scripts/compare-benchmark-jsons.py base.json results.json "${{ matrix.name }}" \
-            > comment.md
+          uv run --no-project scripts/compare-benchmark-jsons.py base.ingest.jsonl results.json \
+            "${{ matrix.name }}" --pr-records results.ingest.jsonl > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment PR
@@ -314,6 +320,7 @@ jobs:
             scripts/post-ingest.py results.ingest.jsonl \
             --postgres "${DSN}" \
             --commit-sha "${{ github.sha }}" \
+            --branch "${{ github.ref_name }}" \
             --region "${AWS_REGION}"
 
       - name: Alert incident.io
