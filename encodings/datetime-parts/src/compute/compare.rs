@@ -53,10 +53,7 @@ impl CompareKernel for DateTimeParts {
             return Ok(None);
         };
 
-        // Fall back to the full timestamp comparison if the literal's days do not fit `i32`.
-        let Ok(ts_parts) = timestamp::split(timestamp, options.unit) else {
-            return Ok(None);
-        };
+        let ts_parts = timestamp::split(timestamp, options.unit)?;
 
         let result = match operator {
             CompareOperator::Eq => compare_eq(lhs, &ts_parts, nullability, ctx)?,
@@ -102,7 +99,7 @@ fn compare_eq(
 
     comparison = compare_dtp(
         lhs.seconds(),
-        ts_parts.seconds,
+        i64::from(ts_parts.seconds),
         CompareOperator::Eq,
         nullability,
     )?
@@ -115,7 +112,7 @@ fn compare_eq(
 
     compare_dtp(
         lhs.subseconds(),
-        ts_parts.subseconds,
+        i64::from(ts_parts.subseconds),
         CompareOperator::Eq,
         nullability,
     )?
@@ -141,7 +138,7 @@ fn compare_ne(
 
     comparison = compare_dtp(
         lhs.seconds(),
-        ts_parts.seconds,
+        i64::from(ts_parts.seconds),
         CompareOperator::NotEq,
         nullability,
     )?
@@ -154,7 +151,7 @@ fn compare_ne(
 
     compare_dtp(
         lhs.subseconds(),
-        ts_parts.subseconds,
+        i64::from(ts_parts.subseconds),
         CompareOperator::NotEq,
         nullability,
     )?
@@ -193,14 +190,24 @@ fn compare_ordered(
     }
     let (days_strict, days_eq) = (days_strict.into_array(), days_eq.into_array());
 
-    let seconds_strict = compare_dtp(lhs.seconds(), ts_parts.seconds, strict, nullability)?;
+    let seconds_strict = compare_dtp(
+        lhs.seconds(),
+        i64::from(ts_parts.seconds),
+        strict,
+        nullability,
+    )?;
     let seconds_eq = compare_dtp(
         lhs.seconds(),
-        ts_parts.seconds,
+        i64::from(ts_parts.seconds),
         CompareOperator::Eq,
         nullability,
     )?;
-    let subseconds = compare_dtp(lhs.subseconds(), ts_parts.subseconds, operator, nullability)?;
+    let subseconds = compare_dtp(
+        lhs.subseconds(),
+        i64::from(ts_parts.subseconds),
+        operator,
+        nullability,
+    )?;
 
     let within_day =
         seconds_strict.binary(seconds_eq.binary(subseconds, Operator::And)?, Operator::Or)?;
@@ -238,7 +245,7 @@ fn valid_rows_all(
 
 fn compare_dtp(
     lhs: &ArrayRef,
-    rhs: i32,
+    rhs: i64,
     operator: CompareOperator,
     nullability: Nullability,
 ) -> VortexResult<ArrayRef> {
@@ -684,6 +691,31 @@ mod test {
                 .map(|(i, value)| (i % 3 != 1).then_some(*value)),
         );
         assert_matches_temporal(nullable, unit, constants)
+    }
+
+    #[rstest]
+    #[case::seconds(TimeUnit::Seconds)]
+    #[case::milliseconds(TimeUnit::Milliseconds)]
+    #[case::microseconds(TimeUnit::Microseconds)]
+    #[case::nanoseconds(TimeUnit::Nanoseconds)]
+    fn test_storage_extremes_match_temporal(#[case] unit: TimeUnit) -> VortexResult<()> {
+        let values = [
+            i64::MIN,     // Smallest storage value.
+            i64::MIN + 1, // Same day as the minimum.
+            -1,           // Before the epoch.
+            0,            // Unix epoch.
+            1,            // After the epoch.
+            i64::MAX - 1, // Same day as the maximum.
+            i64::MAX,     // Largest storage value.
+        ];
+        assert_matches_temporal(PrimitiveArray::from_iter(values), unit, values)?;
+        let nullable = PrimitiveArray::from_option_iter(
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(i, value)| (i != 3).then_some(value)),
+        );
+        assert_matches_temporal(nullable, unit, values)
     }
 
     #[test]

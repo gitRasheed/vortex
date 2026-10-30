@@ -3,11 +3,12 @@
 
 //! Splits temporal arrays into components for independent compression.
 //!
-//! The days part uses `i32`, so second and millisecond timestamps need a range check before the
-//! split can be used. Null slots do not restrict the range of an array.
+//! The split keeps days in `i32` when possible and widens only that component to `i64` for extreme
+//! second or millisecond timestamps. Null slots do not restrict the range of an array.
 
 use std::mem::MaybeUninit;
 
+use num_traits::AsPrimitive;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
@@ -25,17 +26,18 @@ use vortex_array::expr::stats::Stat;
 use vortex_array::expr::stats::StatsProvider;
 use vortex_array::extension::datetime::TimeUnit;
 use vortex_array::scalar::Scalar;
+use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
-use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
-use vortex_error::vortex_err;
 
 use crate::timestamp;
 
-/// The `i32` day, second, and subsecond components of a temporal array.
+/// The day, second, and subsecond components of a temporal array.
 pub struct TemporalParts {
     /// Days since the Unix epoch, carrying the validity of the original timestamps.
+    ///
+    /// Uses `i32` when all non-null days fit, otherwise `i64`.
     pub days: ArrayRef,
     /// Seconds within the day, with non-nullable storage.
     pub seconds: ArrayRef,
@@ -50,18 +52,14 @@ pub struct TemporalParts {
 ///
 /// # Errors
 ///
-/// Returns an error if [`can_split_temporal`] returns `false` or the storage cannot be executed.
+/// Returns an error for day units or if the storage cannot be executed.
 pub fn split_temporal(array: TemporalArray, ctx: &mut ExecutionCtx) -> VortexResult<TemporalParts> {
     let time_unit = array.temporal_metadata().time_unit();
     if matches!(time_unit, TimeUnit::Days) {
         vortex_bail!("Cannot handle day-level data");
     }
 
-    let check_days = match cached_bounds(&array) {
-        Some(bounds) if !bounds_fit(&bounds, time_unit) => return Err(days_overflow(time_unit)),
-        Some(_) => false,
-        None => true,
-    };
+    let check_days = !cached_bounds(&array).is_some_and(|bounds| bounds_fit(&bounds, time_unit));
 
     let temporal_values = array
         .temporal_values()
@@ -96,11 +94,6 @@ pub fn split_temporal(array: TemporalArray, ctx: &mut ExecutionCtx) -> VortexRes
             split_slice_seconds::<false>(days_ptr, seconds_ptr, timestamps)
         };
 
-        // The loop also checks null slots. Reject the split only if a non-null value is too large.
-        if !all_fit && !days_fit(&array, time_unit, ctx)? {
-            return Err(days_overflow(time_unit));
-        }
-
         // SAFETY: `split_slice_seconds` initialized all `length` elements of both buffers.
         unsafe {
             days.set_len(length);
@@ -108,7 +101,13 @@ pub fn split_temporal(array: TemporalArray, ctx: &mut ExecutionCtx) -> VortexRes
         }
 
         return Ok(TemporalParts {
-            days: PrimitiveArray::new(days.freeze(), temporal_values.validity()?).into_array(),
+            days: widen_days_if_needed(
+                PrimitiveArray::new(days.freeze(), temporal_values.validity()?),
+                timestamps,
+                &array,
+                all_fit,
+                ctx,
+            )?,
             seconds: seconds.into_array(),
             subseconds: ConstantArray::new(0, length).into_array(),
         });
@@ -133,11 +132,6 @@ pub fn split_temporal(array: TemporalArray, ctx: &mut ExecutionCtx) -> VortexRes
         _ => unreachable!("Handled before"),
     };
 
-    // The loop also checks null slots. Reject the split only if a non-null value is too large.
-    if !all_fit && !days_fit(&array, time_unit, ctx)? {
-        return Err(days_overflow(time_unit));
-    }
-
     // SAFETY: `split_slice` initialized all `length` elements of the three buffers.
     unsafe {
         days.set_len(length);
@@ -146,26 +140,40 @@ pub fn split_temporal(array: TemporalArray, ctx: &mut ExecutionCtx) -> VortexRes
     }
 
     Ok(TemporalParts {
-        days: PrimitiveArray::new(days.freeze(), temporal_values.validity()?).into_array(),
+        days: widen_days_if_needed(
+            PrimitiveArray::new(days.freeze(), temporal_values.validity()?),
+            timestamps,
+            &array,
+            all_fit,
+            ctx,
+        )?,
         seconds: seconds.into_array(),
         subseconds: subseconds.into_array(),
     })
 }
 
-/// Returns whether every non-null timestamp can use an `i32` days part.
-///
-/// Returns `false` for day units. Empty and all-null arrays fit for every supported unit.
-///
-/// # Errors
-///
-/// Returns an error if the storage values cannot be executed or aggregated.
-pub fn can_split_temporal(array: &TemporalArray, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
+/// Rebuilds only the days buffer when a non-null timestamp exceeds the `i32` range.
+fn widen_days_if_needed(
+    days: PrimitiveArray,
+    timestamps: &[i64],
+    array: &TemporalArray,
+    all_fit: bool,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    // The split checks null slots too. Their values must not force the days buffer to widen.
     let time_unit = array.temporal_metadata().time_unit();
-    if matches!(time_unit, TimeUnit::Days) {
-        return Ok(false);
+    if all_fit || days_fit(array, time_unit, ctx)? {
+        return Ok(days.into_array());
     }
 
-    days_fit(array, time_unit, ctx)
+    let ticks_per_day = match time_unit {
+        TimeUnit::Seconds => timestamp::SECONDS_PER_DAY,
+        TimeUnit::Milliseconds => timestamp::SECONDS_PER_DAY * 1_000,
+        _ => unreachable!("microsecond and nanosecond days always fit i32"),
+    };
+    let wide_days = Buffer::from_iter(timestamps.iter().map(|ts| ts / ticks_per_day));
+
+    Ok(PrimitiveArray::new(wide_days, days.validity()?).into_array())
 }
 
 fn days_fit(
@@ -215,15 +223,8 @@ fn bounds_fit(bounds: &[Scalar; 2], time_unit: TimeUnit) -> bool {
         bound
             .as_primitive()
             .as_::<i64>()
-            .is_some_and(|ts| timestamp::days_fit(ts, time_unit))
+            .is_some_and(|ts| timestamp::days_fit_i32(ts, time_unit))
     })
-}
-
-fn days_overflow(time_unit: TimeUnit) -> VortexError {
-    vortex_err!(
-        "{time_unit} timestamps lie more than i32::MAX days from the epoch and cannot be split \
-         into days"
-    )
 }
 
 /// Adds 2^31 to the days and converts to unsigned, placing in-range days below 2^32.
@@ -265,7 +266,7 @@ fn split_slice<const DIVISOR: i64, const CHECK_DAYS: bool>(
             if CHECK_DAYS {
                 day_offsets |= day_offset::<DIVISOR>(timestamp[k]);
             }
-            day_buf[k] = parts.days;
+            day_buf[k] = parts.days.as_();
             second_buf[k] = parts.seconds;
             subsecond_buf[k] = parts.subseconds;
         }
@@ -286,7 +287,7 @@ fn split_slice<const DIVISOR: i64, const CHECK_DAYS: bool>(
         if CHECK_DAYS {
             day_offsets |= day_offset::<DIVISOR>(ts);
         }
-        day.write(parts.days);
+        day.write(parts.days.as_());
         second.write(parts.seconds);
         subsecond.write(parts.subseconds);
     }
@@ -310,7 +311,7 @@ fn split_slice_seconds<const CHECK_DAYS: bool>(
         if CHECK_DAYS {
             day_offsets |= day_offset::<1>(*ts);
         }
-        day.write(parts.days);
+        day.write(parts.days.as_());
         second.write(parts.seconds);
     }
 
@@ -319,29 +320,42 @@ fn split_slice_seconds<const CHECK_DAYS: bool>(
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
     use std::sync::LazyLock;
 
     use rstest::rstest;
+    use vortex_array::ArrayContext;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
+    use vortex_array::aggregate_fn::NumericalAggregateOpts;
+    use vortex_array::aggregate_fn::fns::min_max::min_max;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::TemporalArray;
     use vortex_array::assert_arrays_eq;
+    use vortex_array::dtype::PType;
     use vortex_array::extension::datetime::TimeUnit;
+    use vortex_array::serde::SerializeOptions;
+    use vortex_array::serde::SerializedArray;
     use vortex_array::validity::Validity;
+    use vortex_buffer::ByteBufferMut;
     use vortex_buffer::buffer;
     use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
-    use vortex_error::vortex_panic;
     use vortex_session::VortexSession;
+    use vortex_session::registry::ReadContext;
 
+    use super::cached_bounds;
     use crate::DateTimeParts;
     use crate::TemporalParts;
-    use crate::can_split_temporal;
+    use crate::array::DateTimePartsArraySlotsExt;
     use crate::split_temporal;
     use crate::timestamp::SECONDS_PER_DAY;
 
-    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+        let session = VortexSession::empty();
+        crate::initialize(&session);
+        session
+    });
 
     #[rstest]
     #[case(Validity::NonNullable)]
@@ -392,13 +406,33 @@ mod tests {
     }
 
     #[rstest]
-    #[case::seconds(TimeUnit::Seconds, false)]
-    #[case::milliseconds(TimeUnit::Milliseconds, false)]
-    #[case::microseconds(TimeUnit::Microseconds, true)]
-    #[case::nanoseconds(TimeUnit::Nanoseconds, true)]
-    fn test_extreme_timestamps_split_exactly_or_fail(
+    #[case::seconds(TimeUnit::Seconds)]
+    #[case::milliseconds(TimeUnit::Milliseconds)]
+    #[case::microseconds(TimeUnit::Microseconds)]
+    #[case::nanoseconds(TimeUnit::Nanoseconds)]
+    fn test_empty_timestamps_stay_narrow(#[case] unit: TimeUnit) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let temporal = TemporalArray::new_timestamp(
+            PrimitiveArray::from_iter(iter::empty::<i64>()).into_array(),
+            unit,
+            None,
+        );
+        let parts = DateTimeParts::try_from_temporal(temporal.clone(), &mut ctx)?;
+        assert_eq!(parts.days().dtype().as_ptype(), PType::I32);
+        assert_arrays_eq!(parts, temporal, &mut ctx);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::seconds(TimeUnit::Seconds, PType::I64)]
+    #[case::milliseconds(TimeUnit::Milliseconds, PType::I64)]
+    #[case::microseconds(TimeUnit::Microseconds, PType::I32)]
+    #[case::nanoseconds(TimeUnit::Nanoseconds, PType::I32)]
+    fn test_extreme_timestamps_roundtrip(
         #[case] unit: TimeUnit,
-        #[case] splittable: bool,
+        #[case] days_ptype: PType,
+        #[values(false, true)] cache_bounds: bool,
     ) -> VortexResult<()> {
         let mut ctx = SESSION.create_execution_ctx();
         let temporal = TemporalArray::new_timestamp(
@@ -412,15 +446,43 @@ mod tests {
             unit,
             Some("UTC".into()),
         );
-        assert_eq!(can_split_temporal(&temporal, &mut ctx)?, splittable);
-
-        let result = DateTimeParts::try_from_temporal(temporal.clone(), &mut ctx);
-        if splittable {
-            assert_arrays_eq!(result?, temporal, &mut ctx);
-        } else {
-            let err = result.unwrap_err();
-            assert!(err.to_string().contains("i32::MAX days"), "{err}");
+        let expected = temporal.clone().into_array();
+        if cache_bounds {
+            min_max(&expected, &mut ctx, NumericalAggregateOpts::default())?;
         }
+        assert_eq!(cached_bounds(&temporal).is_some(), cache_bounds);
+
+        let parts = DateTimeParts::try_from_temporal(temporal, &mut ctx)?;
+        assert_eq!(parts.days().dtype().as_ptype(), days_ptype);
+        assert_arrays_eq!(&parts, &expected, &mut ctx);
+        for index in 0..expected.len() {
+            assert_eq!(
+                parts.execute_scalar(index, &mut ctx)?,
+                expected.execute_scalar(index, &mut ctx)?,
+            );
+        }
+
+        let array_ctx = ArrayContext::empty();
+        let serialized = parts.clone().into_array().serialize(
+            &array_ctx,
+            &SESSION,
+            &SerializeOptions::default(),
+        )?;
+        let mut bytes = ByteBufferMut::empty();
+        for buffer in serialized {
+            bytes.extend_from_slice(&buffer);
+        }
+        let decoded = SerializedArray::try_from(bytes.freeze())?.decode(
+            expected.dtype(),
+            expected.len(),
+            &ReadContext::new(array_ctx.to_ids()),
+            &SESSION,
+        )?;
+        assert_eq!(
+            decoded.as_::<DateTimeParts>().days().dtype().as_ptype(),
+            days_ptype
+        );
+        assert_arrays_eq!(decoded, expected, &mut ctx);
 
         Ok(())
     }
@@ -431,6 +493,7 @@ mod tests {
     fn test_days_at_i32_bounds(
         #[case] unit: TimeUnit,
         #[case] ticks_per_second: i64,
+        #[values(false, true)] cache_bounds: bool,
     ) -> VortexResult<()> {
         let mut ctx = SESSION.create_execution_ctx();
         let ticks_per_day = SECONDS_PER_DAY * ticks_per_second;
@@ -441,24 +504,38 @@ mod tests {
             TemporalArray::new_timestamp(PrimitiveArray::from_iter(values).into_array(), unit, None)
         };
         let fits = temporal(vec![max, 0, min, max, min, 0, max, min, max]);
+        if cache_bounds {
+            min_max(
+                &fits.clone().into_array(),
+                &mut ctx,
+                NumericalAggregateOpts::default(),
+            )?;
+        }
         let parts = DateTimeParts::try_from_temporal(fits.clone(), &mut ctx)?;
+        assert_eq!(parts.days().dtype().as_ptype(), PType::I32);
         assert_arrays_eq!(parts, fits, &mut ctx);
 
         // One past each bound, in the 4-wide chunks and in the remainder.
         for (index, past) in [(1, max + 1), (8, min - 1)] {
             let mut values = vec![0; 9];
             values[index] = past;
-            let Err(err) = split_temporal(temporal(values), &mut ctx) else {
-                vortex_panic!("timestamp exceeds the i32 days bound by one tick");
-            };
-            assert!(err.to_string().contains("i32::MAX days"), "{err}");
+            let temporal = temporal(values);
+            let parts = DateTimeParts::try_from_temporal(temporal.clone(), &mut ctx)?;
+            assert_eq!(parts.days().dtype().as_ptype(), PType::I64);
+            assert_arrays_eq!(parts, temporal, &mut ctx);
         }
 
         Ok(())
     }
 
-    #[test]
-    fn test_out_of_range_null_slots_split() -> VortexResult<()> {
+    #[rstest]
+    #[case::seconds(TimeUnit::Seconds)]
+    #[case::milliseconds(TimeUnit::Milliseconds)]
+    fn test_out_of_range_null_slots_split(
+        #[case] unit: TimeUnit,
+        #[values(Validity::from_iter([true, false, true, false, true]), Validity::AllInvalid)]
+        validity: Validity,
+    ) -> VortexResult<()> {
         let mut ctx = SESSION.create_execution_ctx();
         let values = PrimitiveArray::new(
             buffer![
@@ -468,10 +545,11 @@ mod tests {
                 i64::MIN, // Null slot outside the days range.
                 1,        // Valid next second.
             ],
-            Validity::from_iter([true, false, true, false, true]),
+            validity,
         );
-        let temporal = TemporalArray::new_timestamp(values.into_array(), TimeUnit::Seconds, None);
+        let temporal = TemporalArray::new_timestamp(values.into_array(), unit, None);
         let parts = DateTimeParts::try_from_temporal(temporal.clone(), &mut ctx)?;
+        assert_eq!(parts.days().dtype().as_ptype(), PType::I32);
         assert_arrays_eq!(parts, temporal, &mut ctx);
 
         Ok(())

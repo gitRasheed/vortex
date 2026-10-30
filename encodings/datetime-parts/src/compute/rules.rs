@@ -158,7 +158,7 @@ impl ArrayParentReduceRule<DateTimeParts> for DTPComparisonPushDownRule {
 
 /// Try to extract the days value from a constant timestamp.
 /// Returns None if the constant is not a timestamp or has non-zero seconds/subseconds.
-fn try_extract_days_constant(array: &ArrayRef) -> Option<i32> {
+fn try_extract_days_constant(array: &ArrayRef) -> Option<i64> {
     let constant = array.as_constant()?;
 
     // Extract the timestamp value
@@ -285,9 +285,10 @@ mod tests {
     }
 
     #[test]
-    fn test_days_pushdown_declines_constant_outside_i32_days() {
-        let constant = midnight_constant(i64::from(i32::MAX) + 1, TimeUnit::Seconds, 1);
-        assert_eq!(try_extract_days_constant(&constant), None);
+    fn test_days_constant_outside_i32_days() {
+        let days = i64::from(i32::MAX) + 1;
+        let constant = midnight_constant(days, TimeUnit::Seconds, 1);
+        assert_eq!(try_extract_days_constant(&constant), Some(days));
     }
 
     #[rstest]
