@@ -125,10 +125,16 @@ pub static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
         .register_edition(&UNSTABLE_BENCH_DECLARATION)
         .vortex_expect("bench edition declaration is valid");
     session
+});
+
+/// Enables [`UNSTABLE_BENCH`] on [`SESSION`], so it writes lists with the list layout.
+///
+/// The V2 scan cannot read the list layout yet, so only suites that read through V1 call this.
+fn enable_unstable_bench_edition() {
+    SESSION
         .enable_edition(UNSTABLE_BENCH)
         .vortex_expect("bench edition is registered");
-    session
-});
+}
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
@@ -445,6 +451,7 @@ pub fn create_benchmark(b: BenchmarkArg, opts: &Opts) -> anyhow::Result<Box<dyn 
             Ok(Box::new(benchmark) as _)
         }
         BenchmarkArg::StatPopGen => {
+            enable_unstable_bench_edition();
             let scale_factor = opts.get_as::<u64>(SCALE_FACTOR_KEY).unwrap_or(1);
             let benchmark = StatPopGenBenchmark::new(scale_factor)?;
             Ok(Box::new(benchmark) as _)
@@ -465,6 +472,7 @@ pub fn create_benchmark(b: BenchmarkArg, opts: &Opts) -> anyhow::Result<Box<dyn 
             Ok(Box::new(benchmark) as _)
         }
         BenchmarkArg::PolarSignals => {
+            enable_unstable_bench_edition();
             let scale_factor = opts.get_as::<usize>(SCALE_FACTOR_KEY).unwrap_or(1);
             let benchmark = PolarSignalsBenchmark::new(scale_factor)?;
             Ok(Box::new(benchmark) as _)
