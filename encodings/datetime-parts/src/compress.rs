@@ -10,15 +10,21 @@ use vortex_array::aggregate_fn::NumericalAggregateOpts;
 use vortex_array::aggregate_fn::fns::min_max::MinMaxResult;
 use vortex_array::aggregate_fn::fns::min_max::min_max;
 use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::ExtensionArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::TemporalArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::PType;
+use vortex_array::expr::stats::Stat;
+use vortex_array::expr::stats::StatsProvider;
 use vortex_array::extension::datetime::TimeUnit;
+use vortex_array::scalar::Scalar;
 use vortex_buffer::BufferMut;
+use vortex_error::VortexError;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_err;
 
 use crate::timestamp;
 
@@ -43,12 +49,11 @@ pub fn split_temporal(array: TemporalArray, ctx: &mut ExecutionCtx) -> VortexRes
     if matches!(time_unit, TimeUnit::Days) {
         vortex_bail!("Cannot handle day-level data");
     }
-    if !days_fit(array.temporal_values(), time_unit, ctx)? {
-        vortex_bail!(
-            "{time_unit} timestamps lie more than i32::MAX days from the epoch and cannot be \
-             split into days"
-        );
-    }
+    let check_days = match cached_bounds(&array) {
+        Some(bounds) if !bounds_fit(&bounds, time_unit) => return Err(days_overflow(time_unit)),
+        Some(_) => false,
+        None => true,
+    };
 
     let temporal_values = array
         .temporal_values()
@@ -77,7 +82,15 @@ pub fn split_temporal(array: TemporalArray, ctx: &mut ExecutionCtx) -> VortexRes
     let seconds_ptr = &mut seconds.spare_capacity_mut()[..length];
 
     if matches!(time_unit, TimeUnit::Seconds) {
-        split_slice_seconds(days_ptr, seconds_ptr, timestamps);
+        let all_fit = if check_days {
+            split_slice_seconds::<true>(days_ptr, seconds_ptr, timestamps)
+        } else {
+            split_slice_seconds::<false>(days_ptr, seconds_ptr, timestamps)
+        };
+        // The loops also see null slots, so only valid values decide.
+        if !all_fit && !days_fit(&array, time_unit, ctx)? {
+            return Err(days_overflow(time_unit));
+        }
 
         // SAFETY: all items in [0; length) are filled in split_slice_seconds
         unsafe {
@@ -95,18 +108,17 @@ pub fn split_temporal(array: TemporalArray, ctx: &mut ExecutionCtx) -> VortexRes
     let mut subseconds: BufferMut<i32> = BufferMut::with_capacity(timestamps.len());
     let subseconds_ptr = &mut subseconds.spare_capacity_mut()[..length];
 
-    match time_unit {
-        TimeUnit::Nanoseconds => {
-            split_slice::<1_000_000_000>(days_ptr, seconds_ptr, subseconds_ptr, timestamps)
-        }
-        TimeUnit::Microseconds => {
-            split_slice::<1_000_000>(days_ptr, seconds_ptr, subseconds_ptr, timestamps)
-        }
-        TimeUnit::Milliseconds => {
-            split_slice::<1_000>(days_ptr, seconds_ptr, subseconds_ptr, timestamps)
-        }
+    let (d, s, ss, ts) = (days_ptr, seconds_ptr, subseconds_ptr, timestamps);
+    let all_fit = match time_unit {
+        TimeUnit::Nanoseconds => split_slice::<1_000_000_000, false>(d, s, ss, ts),
+        TimeUnit::Microseconds => split_slice::<1_000_000, false>(d, s, ss, ts),
+        TimeUnit::Milliseconds if check_days => split_slice::<1_000, true>(d, s, ss, ts),
+        TimeUnit::Milliseconds => split_slice::<1_000, false>(d, s, ss, ts),
         _ => unreachable!("Handled before"),
     };
+    if !all_fit && !days_fit(&array, time_unit, ctx)? {
+        return Err(days_overflow(time_unit));
+    }
 
     // SAFETY: all items in [0; length) are filled in split_slice
     unsafe {
@@ -128,32 +140,77 @@ pub fn can_split_temporal(array: &TemporalArray, ctx: &mut ExecutionCtx) -> Vort
     if matches!(time_unit, TimeUnit::Days) {
         return Ok(false);
     }
-    days_fit(array.temporal_values(), time_unit, ctx)
+    days_fit(array, time_unit, ctx)
 }
 
-fn days_fit(values: &ArrayRef, time_unit: TimeUnit, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
+fn days_fit(
+    array: &TemporalArray,
+    time_unit: TimeUnit,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<bool> {
     if matches!(time_unit, TimeUnit::Microseconds | TimeUnit::Nanoseconds) {
         return Ok(true);
     }
-    let Some(MinMaxResult { min, max }) = min_max(values, ctx, NumericalAggregateOpts::default())?
-    else {
-        return Ok(true);
+    let bounds = match cached_bounds(array) {
+        Some(bounds) => bounds,
+        None => match min_max(
+            array.temporal_values(),
+            ctx,
+            NumericalAggregateOpts::default(),
+        )? {
+            Some(MinMaxResult { min, max }) => [min, max],
+            None => return Ok(true),
+        },
     };
-    Ok([min, max].iter().all(|bound| {
+    Ok(bounds_fit(&bounds, time_unit))
+}
+
+/// Exact min and max cached on the array, which the layout writer computes before compressing.
+fn cached_bounds(array: &TemporalArray) -> Option<[Scalar; 2]> {
+    let ext = ExtensionArray::from(array);
+    let stats = ext.statistics();
+    if let (Some(min), Some(max)) = (
+        stats.get(Stat::Min).as_exact(),
+        stats.get(Stat::Max).as_exact(),
+    ) {
+        return Some([min, max].map(|bound| bound.as_extension().to_storage_scalar()));
+    }
+    let stats = array.temporal_values().statistics();
+    let min = stats.get(Stat::Min).as_exact()?;
+    let max = stats.get(Stat::Max).as_exact()?;
+    Some([min, max])
+}
+
+fn bounds_fit(bounds: &[Scalar; 2], time_unit: TimeUnit) -> bool {
+    bounds.iter().all(|bound| {
         bound
             .as_primitive()
             .as_::<i64>()
             .is_some_and(|ts| timestamp::days_fit(ts, time_unit))
-    }))
+    })
+}
+
+fn days_overflow(time_unit: TimeUnit) -> VortexError {
+    vortex_err!(
+        "{time_unit} timestamps lie more than i32::MAX days from the epoch and cannot be split \
+         into days"
+    )
+}
+
+/// Days plus 2^31, below 2^32 exactly when the days fit `i32`, so the loops can OR them branch-free.
+#[inline]
+fn day_offset<const DIVISOR: i64>(timestamp: i64) -> u64 {
+    (timestamp / (timestamp::SECONDS_PER_DAY * DIVISOR) - i64::from(i32::MIN)).cast_unsigned()
 }
 
 #[inline]
-fn split_slice<const DIVISOR: i64>(
+fn split_slice<const DIVISOR: i64, const CHECK_DAYS: bool>(
     days: &mut [MaybeUninit<i32>],
     seconds: &mut [MaybeUninit<i32>],
     subseconds: &mut [MaybeUninit<i32>],
     timestamps: &[i64],
-) {
+) -> bool {
+    let mut day_offsets = 0u64;
     // Computing chunks of 4 elements lets LLVM optimize stores into
     // a 16-byte vector store per chunk.
     let length = timestamps.len();
@@ -169,6 +226,9 @@ fn split_slice<const DIVISOR: i64>(
         let mut subsecond_buf = [0i32; 4];
         for k in 0..4 {
             let parts = timestamp::split_with_divisor::<DIVISOR>(timestamp[k]);
+            if CHECK_DAYS {
+                day_offsets |= day_offset::<DIVISOR>(timestamp[k]);
+            }
             day_buf[k] = parts.days;
             second_buf[k] = parts.seconds;
             subsecond_buf[k] = parts.subseconds;
@@ -187,23 +247,32 @@ fn split_slice<const DIVISOR: i64>(
         .zip(subseconds_rem);
     for (((&ts, day), second), subsecond) in remainder {
         let parts = timestamp::split_with_divisor::<DIVISOR>(ts);
+        if CHECK_DAYS {
+            day_offsets |= day_offset::<DIVISOR>(ts);
+        }
         day.write(parts.days);
         second.write(parts.seconds);
         subsecond.write(parts.subseconds);
     }
+    day_offsets >> 32 == 0
 }
 
 #[inline]
-fn split_slice_seconds(
+fn split_slice_seconds<const CHECK_DAYS: bool>(
     days: &mut [MaybeUninit<i32>],
     seconds: &mut [MaybeUninit<i32>],
     timestamps: &[i64],
-) {
+) -> bool {
+    let mut day_offsets = 0u64;
     for ((day, second), ts) in days.iter_mut().zip(seconds).zip(timestamps) {
         let parts = timestamp::split_with_divisor::<1>(*ts);
+        if CHECK_DAYS {
+            day_offsets |= day_offset::<1>(*ts);
+        }
         day.write(parts.days);
         second.write(parts.seconds);
     }
+    day_offsets >> 32 == 0
 }
 
 #[cfg(test)]
@@ -227,6 +296,7 @@ mod tests {
     use crate::TemporalParts;
     use crate::can_split_temporal;
     use crate::split_temporal;
+    use crate::timestamp::SECONDS_PER_DAY;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
@@ -306,6 +376,46 @@ mod tests {
                 assert!(err.to_string().contains("i32::MAX days"), "{err}");
             }
         }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::seconds(TimeUnit::Seconds, 1)]
+    #[case::milliseconds(TimeUnit::Milliseconds, 1_000)]
+    fn days_at_i32_bounds(
+        #[case] unit: TimeUnit,
+        #[case] ticks_per_second: i64,
+    ) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let ticks_per_day = SECONDS_PER_DAY * ticks_per_second;
+        let max = i64::from(i32::MAX) * ticks_per_day + ticks_per_day - 1;
+        let min = i64::from(i32::MIN) * ticks_per_day - ticks_per_day + 1;
+        let temporal = |values: Vec<i64>| {
+            TemporalArray::new_timestamp(PrimitiveArray::from_iter(values).into_array(), unit, None)
+        };
+        let fits = temporal(vec![max, 0, min, max, min, 0, max, min, max]);
+        let parts = DateTimeParts::try_from_temporal(fits.clone(), &mut ctx)?;
+        assert_arrays_eq!(parts, fits, &mut ctx);
+
+        // One past each bound, in the 4-wide chunks and in the remainder.
+        for (index, past) in [(1, max + 1), (8, min - 1)] {
+            let mut values = vec![0; 9];
+            values[index] = past;
+            assert!(split_temporal(temporal(values), &mut ctx).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_range_null_slots_split() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = PrimitiveArray::new(
+            buffer![0i64, i64::MAX, 86_400, i64::MIN, 1],
+            Validity::from_iter([true, false, true, false, true]),
+        );
+        let temporal = TemporalArray::new_timestamp(values.into_array(), TimeUnit::Seconds, None);
+        let parts = DateTimeParts::try_from_temporal(temporal.clone(), &mut ctx)?;
+        assert_arrays_eq!(parts, temporal, &mut ctx);
         Ok(())
     }
 }
