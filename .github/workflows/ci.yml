@@ -402,24 +402,25 @@ jobs:
           enable-sccache: "true"
       - name: Install nightly for fmt
         run: rustup toolchain install $NIGHTLY_TOOLCHAIN --component rustfmt
-      # Run one Cargo command at a time so it can use the whole runner and reuse
-      # artifacts from the shared target directory in subsequent checks.
-      - name: Rust Lint - Format
-        id: fmt
-        continue-on-error: true
-        run: cargo +$NIGHTLY_TOOLCHAIN fmt --all --check
-      - name: Rustc check (release)
-        id: check-release
-        continue-on-error: true
-        run: RUSTFLAGS="-D warnings" cargo check --locked --all-features --all-targets --release
-      - name: Rust Lint - Clippy All Features
-        id: clippy-all
-        continue-on-error: true
-        run: cargo clippy --profile ci --locked --all-features --all-targets -- -D warnings
-      - name: Rust Lint - Clippy Default Features
-        id: clippy-default
-        continue-on-error: true
-        run: cargo clippy --profile ci --locked --all-targets -- -D warnings
+      # Cargo locks each profile's target directory, so the release check runs
+      # alongside clippy while the two ci-profile clippy runs take turns.
+      - parallel:
+          - name: Rust Lint - Format
+            id: fmt
+            continue-on-error: true
+            run: cargo +$NIGHTLY_TOOLCHAIN fmt --all --check
+          - name: Rustc check (release)
+            id: check-release
+            continue-on-error: true
+            run: RUSTFLAGS="-D warnings" cargo check --locked --all-features --all-targets --release
+          - name: Rust Lint - Clippy All Features
+            id: clippy-all
+            continue-on-error: true
+            run: cargo clippy --profile ci --locked --all-features --all-targets -- -D warnings
+          - name: Rust Lint - Clippy Default Features
+            id: clippy-default
+            continue-on-error: true
+            run: cargo clippy --profile ci --locked --all-targets -- -D warnings
       - name: Check lint results
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
